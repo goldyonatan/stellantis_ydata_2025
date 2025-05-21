@@ -4,3 +4,7 @@ scikit-learn>=0.24.0
 matplotlib>=3.4.0
 seaborn>=0.11.0
 pyarrow>=6.0.0
+geopandas>=0.10.0
+shapely>=1.7.0
+h3>=3.7.6
+meteostat>=1.6.5
