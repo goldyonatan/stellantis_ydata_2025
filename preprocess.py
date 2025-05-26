@@ -38,88 +38,36 @@ except ImportError:
     def h3_to_latlon(h3_index): raise NotImplementedError("HelperFuncs not found")
 
 # --- Configuration Block (Moved outside main for better visibility) ---
-INPUT_FILE_PATH = r'C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\df_sample\df_sample.parquet'
-OUTPUT_FILE_PATH = r'C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\clean_df\clean_df.parquet'
-# *** Path to your land shapefile ***
-#LAND_SHAPEFILE_PATH = r"C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\ne_10m_land\ne_10m_land.shp"
+from cons import INPUT_FILE_PATH
+from cons import CLEANED_DATA_PATH as OUTPUT_FILE_PATH
+# from cons import LAND_SHAPEFILE_PATH
 
 # --- Preprocessing Thresholds ---
-MIN_TRIP_KM = 0.5 # Increased slightly from 0 to avoid noise trips
-MAX_TRIP_KM = 500.0 # max length
-MAX_GPS_JUMP_KM = 5.0 # Max distance between consecutive GPS points
-MAX_CONSECUTIVE_SPEED_DIFF = 100 # Max diff between mean speed of consecutive records (kph)
-MAX_CONSECUTIVE_ALT_DIFF = 500 # Max altitude diff between consecutive records (meters)
-MAX_CONSECUTIVE_SOC_DIFF = 10 # Max SoC % diff between consecutive records
-MAX_CONSECUTIVE_TEMP_DIFF = 5 # Max Temp C diff between consecutive records
-MAX_CONSECUTIVE_TIME_GAP_SECONDS = 110 # Max seconds between consecutive records (110 sec)
-MIN_VALID_SOC = 0
-MAX_VALID_SOC = 100
-MIN_VALID_TEMP = -20
-MAX_VALID_TEMP = 50
-MIN_VALID_ALTITUDE = -500 # Allow slightly below sea level
-MAX_VALID_ALTITUDE = 10000 # Reasonable max altitude
-MIN_VALID_BATT_HEALTH = 50 # SOH %
-MAX_VALID_BATT_HEALTH = 130 # SOH %
-MAX_VALID_ODO = 1000000 # Max odometer reading (km)
-MAX_VALID_WEIGHT = 5000 # Max empty weight (kg)
-MIN_VALID_WEIGHT = 500 # Min empty weight (kg)
-SPEED_DIST_TOLERANCE_FACTOR = 3.5 # Allow distance covered to be X times speed*time (for accel/decel)
-SOC_INCREASE_THRESHOLD = 0.5 # Allow small SoC increases (regen, noise)
+from cons import MIN_TRIP_KM, MAX_TRIP_KM, MAX_GPS_JUMP_KM, MAX_CONSECUTIVE_SPEED_DIFF, MAX_CONSECUTIVE_ALT_DIFF
+from cons import MAX_CONSECUTIVE_SOC_DIFF, MAX_CONSECUTIVE_TEMP_DIFF, MAX_CONSECUTIVE_TIME_GAP_SECONDS
+from cons import MIN_VALID_SOC, MAX_VALID_SOC, MIN_VALID_TEMP, MAX_VALID_TEMP
+from cons import MIN_VALID_ALTITUDE, MAX_VALID_ALTITUDE, MIN_VALID_BATT_HEALTH, MAX_VALID_BATT_HEALTH
+from cons import MAX_VALID_ODO, MAX_VALID_WEIGHT, MIN_VALID_WEIGHT
+from cons import SPEED_DIST_TOLERANCE_FACTOR, SOC_INCREASE_THRESHOLD
 
-FILTER_ZERO_COORDINATES = True # Filter individual (0,0) points?
-FILTER_MOSTLY_ZERO_TRIPS = True # Filter trips with >75% (0,0) points?
-ZERO_TRIP_THRESHOLD = 0.75 # Threshold for filtering trips
 
-# MAX_WEATHER_STATION_DIST_KM = 35 # Max distance to nearest station for weather data to be considered reliable
-MAX_TEMP_DIFFERENCE_C = 5 # Max allowed diff between vehicle temp and weather temp
-FETCH_WEATHER_DATA = False # Set to False to skip weather fetching/comparison
-PROCESS_SUBSET = None # Set to an integer (e.g., 5000) to process only the first N rows for testing
+# Prprocessing parameters
+from cons import FILTER_ZERO_COORDINATES, FILTER_MOSTLY_ZERO_TRIPS, ZERO_TRIP_THRESHOLD
+#from cons import MAX_WEATHER_STATION_DIST_KM
+from cons import MAX_TEMP_DIFFERENCE_C, FETCH_WEATHER_DATA, PROCESS_SUBSET
 
 # --- Column Rename Mapping ---
-COLUMN_RENAME_MAP = {
-    'FAMILY_LABEL': 'car_model','COMMERCIAL_BRAND_COMPONENT_TYP': 'manufacturer',
-    'TYPE_OF_TRACTION_CHAIN': 'traction_type','EMPTY_WEIGHT_KG': 'empty_weight_kg',
-    'DESTINATION_COUNTRY_CODE': 'destination_country_code','BATTERY_TYPE': 'battery_type',
-    'LEV_BATT_CAPC_HEAL': 'battery_health','CYCLE_ID': 'trip_id',
-    'MESS_ID_START': 'message_session_id','DATETIME_START': 'cycle_datetime_start',
-    'DATETIME_END': 'cycle_datetime_end','dt': 'cycle_date',
-    'SOC_START': 'cycle_soc_start','SOC_END': 'cycle_soc_end',
-    'ODO_START': 'cycle_odo_start','ODO_END': 'cycle_odo_end',
-    'geoindex_10_start': 'cycle_location_start','geoindex_10_end': 'cycle_location_end',
-    'HEAD_COLL_TIMS': 'timestamp','PERD_VEHC_LIFT_MILG': 'current_odo',
-    'LEV_BATT_LOAD_LEVL': 'current_soc','geoindex_10': 'current_location',# This is the H3 index column
-    'latitude': 'latitude', # Include even if not present in input, will be created
-    'longitude': 'longitude', # Include even if not present in input, will be created
-    'PERD_VEHC_OUTS_TEMP': 'outside_temp','PERD_ALTT': 'altitude_array',
-    'PERD_VEHC_LONG_SPD': 'speed_array',
-}
+from cons import COLUMN_RENAME_MAP
 
 # --- Standard Column Names (used internally after renaming) ---
-TRIP_ID_COL = 'trip_id'
-TIME_COL = 'timestamp'
-ODO_COL = 'current_odo'
-SOC_COL = 'current_soc'
-H3_COL = 'current_location' # Standard name for the H3 index column
-LAT_COL = 'latitude'       # Standard name for the latitude column TO BE CREATED
-LON_COL = 'longitude'      # Standard name for the longitude column TO BE CREATED
-SPEED_ARRAY_COL = 'speed_array'
-ALT_ARRAY_COL = 'altitude_array'
-VEHICLE_TEMP_COL = 'outside_temp' # Standard name for vehicle temp
-BATT_HEALTH_COL = 'battery_health'
-WEIGHT_COL = 'empty_weight_kg'
-MSG_SESSION_ID_COL = 'message_session_id'
+from cons import TRIP_ID_COL, TIME_COL, ODO_COL, SOC_COL, H3_COL
+from cons import LAT_COL, LON_COL, SPEED_ARRAY_COL, ALT_ARRAY_COL, VEHICLE_TEMP_COL
+from cons import BATT_HEALTH_COL, WEIGHT_COL, MSG_SESSION_ID_COL
 
 # Columns expected constant per trip
-STATIC_TRIP_COLS = [
-    'car_model', 'manufacturer', 'traction_type', 'empty_weight_kg',
-    'destination_country_code', 'battery_type',
-    'message_session_id', 'cycle_datetime_start', 'cycle_datetime_end',
-    'cycle_date', 'cycle_soc_start', 'cycle_soc_end', 'cycle_odo_start',
-    'cycle_odo_end', 'cycle_location_start', 'cycle_location_end'
-]
-# Columns for duplicate row check
-DUPLICATE_CHECK_COLS_STD = [TRIP_ID_COL, TIME_COL]
-# -------------------------
+from cons import STATIC_TRIP_COLS, DUPLICATE_CHECK_COLS_STD
+
+
 
 # --- Individual Preprocessing Functions (Updated) ---
 

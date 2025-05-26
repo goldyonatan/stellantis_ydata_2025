@@ -13,6 +13,13 @@ import time
 from polyline import decode
 import traceback # For detailed error logging
 
+# --- Land Check Helper ---
+from cons import GEO_FILE_PATH
+world = gpd.read_file(GEO_FILE_PATH)
+
+# Instead of using 'unary_union', use 'union_all()' on the GeoSeries of geometries:
+land = world.geometry.union_all()
+
 def load_file(filepath, **kwargs):
     """
     Loads data from various file types into memory.
@@ -249,9 +256,6 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     distance = R * c  # distance in kilometers
     return distance
 
-world = gpd.read_file(r"C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\110m_cultural\ne_110m_admin_0_countries.shp")
-# Instead of using 'unary_union', use 'union_all()' on the GeoSeries of geometries:
-land = world.geometry.union_all()
 
 def is_on_land(lat, lon):
     # Create a Point (note: order is longitude, latitude)

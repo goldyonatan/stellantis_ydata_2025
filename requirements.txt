@@ -8,3 +8,5 @@ geopandas>=0.10.0
 shapely>=1.7.0
 h3>=3.7.6
 meteostat>=1.6.5
+requests>=2.25.1
+polylines>=0.57

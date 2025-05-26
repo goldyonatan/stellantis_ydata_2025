@@ -3,6 +3,21 @@ import pandas as pd
 import os
 import warnings
 
+# import contants definitions from cons.py:
+
+# configuration:
+from cons import CLEANED_DATA_PATH, SEGMENTATION_DICT_DIR, SEGMENTATION_DICT_FILENAME
+from cons import OUTPUT_FORMAT_FOR_SEGMENTATION as OUTPUT_FORMAT
+
+# Parameters from stop-finding and segmentation:
+from cons import STOP_SPEED_KPH, STOP_DIST_KM, MIN_SEGMENT_POINTS, CONSECUTIVE_STOPS_FOR_BREAK
+
+# standard column names:
+from cons import TRIP_ID_COL, TIME_COL, ODO_COL, SPEED_ARRAY_COL
+
+
+
+
 # --- Import necessary functions from HelperFuncs ---
 try:
     # Import the renamed/modified sort function
@@ -270,24 +285,7 @@ def main():
     """Loads cleaned data, finds stops, segments trips, and saves results."""
 
     # --- Configuration ---
-    CLEANED_DATA_PATH = r'C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\clean_df\clean_df.parquet'
-    SEGMENTATION_DICT_DIR = r"C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\segmentation_dict"
-    SEGMENTATION_DICT_FILENAME = 'cycles_seg_dict_v2'
-    OUTPUT_FORMAT = 'pickle'
-    
-    # Parameters for stop finding and segmentation
-    STOP_SPEED_KPH = 1.5 # Speed threshold for stops
-    STOP_DIST_KM = 0.05 # Odo distance threshold for stops
-    MIN_SEGMENT_POINTS = 10 # Minimum number of non-stop data points for a valid segment
-    CONSECUTIVE_STOPS_FOR_BREAK = 3 # Number of consecutive stop points to end a driving block
-    # --------------------
 
-    # --- Standard Column Names (Must match output of preprocessing script) ---
-    TRIP_ID_COL = 'trip_id'
-    TIME_COL = 'timestamp'
-    ODO_COL = 'current_odo'
-    SPEED_ARRAY_COL = 'speed_array'
-    # --------------------
 
     print(f"--- Starting Trip Segmentation Pipeline ---")
     print(f"\nInput cleaned data file: {CLEANED_DATA_PATH}")

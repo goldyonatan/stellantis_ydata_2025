@@ -30,50 +30,34 @@ except ImportError:
     def get_route_predictions_osrm(slat,slon,elat,elon): return {'predicted_distance_m': np.nan, 'predicted_duration_s': np.nan}
     def get_route_elevation_change(slat,slon,elat,elon): return {'predicted_elevation_gain': 0.0, 'predicted_elevation_loss': 0.0}
 
-# --- Configuration Block ---
-CLEANED_DATA_PATH = r'C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\clean_df\clean_df.parquet'
-SEGMENTATION_DICT_PATH = r"C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\segmentation_dict\cycles_seg_dict_v2.pickle"
-GLOBAL_MODEL_PATH = r"C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\models\global_baseline_model.joblib"
-OUTPUT_FEATURE_PATH = r"C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\segments_df\segments_features_v4_behavior.parquet" # Updated name
-OSRM_URL = "http://router.project-osrm.org" # Public instance - use responsibly! Or set up local instance.
+from cons import CLEANED_DATA_PATH, SEGMENTATION_DICT_DIR, SEGMENTATION_DICT_FILENAME, GLOBAL_MODEL_PATH, OUTPUT_FEATURE_PATH, OSRM_URL
+from cons import MIN_SEGMENTS_PER_TRIP
 
-MIN_SEGMENTS_PER_TRIP = 2
-OUTPUT_FORMAT = 'parquet'
+from cons import OUTPUT_FORMAT_FOR_FEAT_EXTRACTION as OUTPUT_FORMAT
+from cons import FETCH_ROUTING_FEATURES # For predicted route (start->end)
 
-FETCH_ROUTING_FEATURES = True # For predicted route (start->end)
-#FETCH_MAP_MATCHING = True # For matched route comparison
-#PROCESS_SUBSET = None # To process only x samples
-# *** New Flag: Set to True only AFTER global model is trained and saved ***
-CALCULATE_GLOBAL_PREDS = True # Default to False for initial run
-# --------------------
+# from cons import FETCH_MAP_MATCHING # For matched route compariso
+# from cons import PROCESS_SUBSET  # To process only x samples
+# from cons import JERK_THRESHOLD_MPS3
+
+from cons import CALCULATE_GLOBAL_PREDS # *** New Flag: Set to True only AFTER global model is trained and saved ***, default false for initial run
 
 # --- Driving Behavior & Matching Thresholds ---
-ACCEL_THRESHOLD_MPS2 = 1.5; DECEL_THRESHOLD_MPS2 = -1.5; #JERK_THRESHOLD_MPS3 = 2.0
+from cons import ACCEL_THRESHOLD_MPS2, DECEL_THRESHOLD_MPS2
 
-# Map Matching Config
-INITIAL_MATCH_RADIUS = 25; MAX_MATCH_RADIUS = 100; MATCH_RETRY_ATTEMPTS = 3
-MATCH_DISTANCE_TOLERANCE_PCT = 10.0; GAPS_THRESHOLD_S = 300
-#MAX_POINTS_PER_OSRM_REQUEST = 500 # Limit points sent to OSRM match
-#API_DELAY_S = 0.05 # Small delay between OSRM calls to be nice to public server
-#MATCH_RADIUS_MULTIPLIER = 1.5
-# ---------------------------------------------
+
+# ---- Map Matching Config
+from cons import INITIAL_MATCH_RADIUS, MAX_MATCH_RADIUS, MATCH_RETRY_ATTEMPTS, MATCH_DISTANCE_TOLERANCE_PCT, GAPS_THRESHOLD_S
+
+#from cons import MAX_POINTS_PER_OSRM_REQUEST # Limit points sent to OSRM match
+#from cons import API_DELAY_S # Small delay between OSRM calls to be nice to public server
+#from cons import MATCH_RADIUS_MULTIPLIER 
+
 
 # --- Standard Column Names (Must match output of preprocessing script) ---
-TRIP_ID_COL = 'trip_id'
-TIME_COL = 'timestamp'
-ODO_COL = 'current_odo'
-SOC_COL = 'current_soc'
-SPEED_ARRAY_COL = 'speed_array'
-ALT_ARRAY_COL = 'altitude_array'
-TEMP_COL = 'outside_temp'
-BATT_HEALTH_COL = 'battery_health' # Example static feature
-LAT_COL = 'latitude'
-LON_COL = 'longitude'
+from cons import TRIP_ID_COL, TIME_COL, ODO_COL, SOC_COL, SPEED_ARRAY_COL, ALT_ARRAY_COL, TEMP_COL, BATT_HEALTH_COL, LAT_COL, LON_COL
+from cons import MEAN_SPEED_KPH_COL, ACCEL_MPS2_COL, JERK_MPS3_COL, TIME_DIFF_S_COL
 
-MEAN_SPEED_KPH_COL = 'mean_speed_kph'
-ACCEL_MPS2_COL = 'accel_mps2' 
-JERK_MPS3_COL = 'jerk_mps3'
-TIME_DIFF_S_COL = 'time_diff_s'
 
 # Add ALL other standard column names from clean_df.parquet that are needed
 # -------------------------------------------------
@@ -507,6 +491,8 @@ def main():
     # -----------------------------------------------------------------
 
     print(f"\nInput cleaned data file: {CLEANED_DATA_PATH}")
+
+    SEGMENTATION_DICT_PATH = os.path.join(SEGMENTATION_DICT_DIR, SEGMENTATION_DICT_FILENAME)
     print(f"Input segmentation dict: {SEGMENTATION_DICT_PATH}")
     print(f"Input global model: {GLOBAL_MODEL_PATH}")
     print(f"Output features file: {OUTPUT_FEATURE_PATH}")
