@@ -12,6 +12,8 @@ import h3
 import time
 from polyline import decode
 import traceback # For detailed error logging
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 def load_file(filepath, **kwargs):
     """
@@ -292,14 +294,20 @@ def get_trip_level_df(df):
 
     return trip_level_df
 
-def random_partition(total, parts):
+def random_partition(total, parts, random_state=42):
     """Randomly partition an integer 'total' into 'parts' nonnegative integers that sum to 'total'."""
     # If parts is less than or equal to 1, no partitioning is needed.
     if parts <= 1:
         return [total]
     
+    # Initialize a local RNG for reproducibility
+    if isinstance(random_state, random.Random):
+        rng = random_state
+    else:
+        rng = random.Random(random_state)
+
     # Pick 'parts-1' divider positions uniformly from 1 to total+parts-1 (inclusive).
-    dividers = sorted(random.sample(range(1, total + parts), parts - 1))
+    dividers = sorted(rng.sample(range(1, total + parts), parts - 1))
     
     # The first partition: stars before the first divider.
     partition = [dividers[0] - 1]
@@ -753,3 +761,205 @@ def analyze_speeding(segment_kinematics, osrm_match_result):
     results['percent_time_over_limit_seg_agg'] = results.get('percent_time_over_limit_seg_agg', 0.0)
     if pd.isna(results['percent_time_over_limit_seg_agg']): results['percent_time_over_limit_seg_agg'] = 0.0
     return results
+
+# --- Helper function for trip-level split ---
+def split_trips_train_test(segments_df, trip_id_col, test_size_trips=0.2, random_state=None):
+    """Splits unique trip IDs into training and testing sets."""
+    unique_trips = segments_df[trip_id_col].unique()
+    if len(unique_trips) < 2: # Cannot split if only one trip or no trips
+        warnings.warn("Not enough unique trips to perform a train/test split. Using all trips for both if possible.")
+        return unique_trips, unique_trips # Or handle as an error
+
+    # Ensure test_size_trips results in at least one trip in each set if possible
+    if int(len(unique_trips) * test_size_trips) < 1 and len(unique_trips) > 1:
+        # Ensure at least one test trip if there are multiple trips
+        num_test_trips = 1
+    elif int(len(unique_trips) * (1 - test_size_trips)) < 1 and len(unique_trips) > 1:
+        # Ensure at least one training trip
+        num_test_trips = len(unique_trips) - 1
+    else:
+        num_test_trips = int(len(unique_trips) * test_size_trips)
+
+    if num_test_trips == 0 and len(unique_trips) > 0: # If only 1 trip, test_size might make it 0
+        num_test_trips = 1 if len(unique_trips) > 1 else 0 # Ensure test has 1 if possible, else 0
+    
+    num_train_trips = len(unique_trips) - num_test_trips
+    if num_train_trips < 1 and len(unique_trips) > num_test_trips : # Ensure train has at least 1 if possible
+        num_train_trips = 1
+        num_test_trips = len(unique_trips) - 1
+
+
+    if random_state is not None:
+        np.random.seed(random_state)
+    
+    shuffled_trips = np.random.permutation(unique_trips)
+    
+    # Ensure split logic handles small numbers of trips correctly
+    if num_test_trips >= len(shuffled_trips): # If test size is too large, assign all but one to test (if >1 trips)
+        test_trip_ids = shuffled_trips
+        train_trip_ids = np.array([]) if len(shuffled_trips) <=1 else shuffled_trips[:1] # Keep at least one for train if possible
+        if len(shuffled_trips) > 1 and num_test_trips == len(shuffled_trips): # if all are test, move one to train
+            train_trip_ids = np.array([shuffled_trips[0]])
+            test_trip_ids = shuffled_trips[1:]
+
+    elif num_train_trips >= len(shuffled_trips): # If train size is too large
+        train_trip_ids = shuffled_trips
+        test_trip_ids = np.array([]) if len(shuffled_trips) <=1 else shuffled_trips[:1]
+        if len(shuffled_trips) > 1 and num_train_trips == len(shuffled_trips):
+            test_trip_ids = np.array([shuffled_trips[0]])
+            train_trip_ids = shuffled_trips[1:]
+    else:
+        test_trip_ids = shuffled_trips[:num_test_trips]
+        train_trip_ids = shuffled_trips[num_test_trips:]
+
+    if len(train_trip_ids) == 0 and len(test_trip_ids) > 0: # Ensure train is not empty if test has trips
+        train_trip_ids = np.array([test_trip_ids[0]])
+        test_trip_ids = test_trip_ids[1:]
+    elif len(test_trip_ids) == 0 and len(train_trip_ids) > 0: # Ensure test is not empty if train has trips
+        test_trip_ids = np.array([train_trip_ids[0]])
+        train_trip_ids = train_trip_ids[1:]
+
+
+    print(f"   Trip split: {len(train_trip_ids)} train trip(s), {len(test_trip_ids)} test trip(s).")
+    if len(train_trip_ids) == 0 or len(test_trip_ids) == 0 and len(unique_trips) > 1:
+        warnings.warn(f"Train/Test split resulted in an empty set (Train: {len(train_trip_ids)}, Test: {len(test_trip_ids)}) for {len(unique_trips)} unique trips. This may cause issues.")
+
+    return train_trip_ids, test_trip_ids
+
+def remove_highly_collinear_numerical_features(df_numerical, threshold=0.90):
+    """
+    Removes highly collinear numerical features from a DataFrame with verbose output.
+
+    Args:
+        df_numerical (pd.DataFrame): DataFrame containing only numerical features.
+        threshold (float): Correlation threshold above which features are considered collinear.
+
+    Returns:
+        pd.DataFrame: DataFrame with highly collinear features removed.
+        list: List of column names that were removed.
+    """
+    if df_numerical.empty or df_numerical.shape[1] < 2:
+        return df_numerical, []
+
+    print(f"   Applying collinearity removal to {df_numerical.shape[1]} numerical features (threshold={threshold})...")
+    
+    # Work on a copy to avoid modifying the original df passed to this function during iterations
+    df_to_filter = df_numerical.copy()
+    
+    to_drop_overall = set()
+    removed_features_overall = []
+
+    iteration = 0
+    while True: # Keep iterating until no more features are dropped in an iteration
+        iteration += 1
+        # print(f"     Collinearity Iteration {iteration}")
+        if df_to_filter.shape[1] < 2: break # Not enough columns to compare
+
+        corr_matrix = df_to_filter.corr().abs()
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        
+        dropped_in_this_iteration = False
+        
+        # Iterate through columns to find the first highly correlated pair not yet processed
+        # Sorting columns ensures a deterministic order of processing pairs
+        sorted_columns = sorted(upper.columns)
+
+        for i in range(len(sorted_columns)):
+            col1 = sorted_columns[i]
+            if col1 in to_drop_overall: continue
+
+            for j in range(i + 1, len(sorted_columns)):
+                col2 = sorted_columns[j]
+                if col2 in to_drop_overall: continue
+
+                if upper.loc[col1, col2] > threshold: # Found a highly correlated pair
+                    print(f"     - Pair: ('{col1}', '{col2}') correlation = {upper.loc[col1, col2]:.4f} (> {threshold})")
+                    
+                    # Heuristic: Drop the one with higher average correlation with *other remaining* features
+                    # Calculate average correlation for col1 with other features (excluding col2 and already dropped)
+                    other_features_for_col1 = list(set(df_to_filter.columns) - {col1, col2})
+                    avg_corr_col1 = 0
+                    if other_features_for_col1:
+                         avg_corr_col1 = df_to_filter[other_features_for_col1].corrwith(df_to_filter[col1]).abs().mean()
+                         if pd.isna(avg_corr_col1): avg_corr_col1 = 0 # Handle case with no other features or all NaN corrs
+                    
+                    # Calculate average correlation for col2 with other features (excluding col1 and already dropped)
+                    other_features_for_col2 = list(set(df_to_filter.columns) - {col1, col2})
+                    avg_corr_col2 = 0
+                    if other_features_for_col2:
+                        avg_corr_col2 = df_to_filter[other_features_for_col2].corrwith(df_to_filter[col2]).abs().mean()
+                        if pd.isna(avg_corr_col2): avg_corr_col2 = 0
+
+                    print(f"       - Avg Abs Corr with others: '{col1}'={avg_corr_col1:.4f}, '{col2}'={avg_corr_col2:.4f}")
+
+                    if avg_corr_col1 >= avg_corr_col2: # Drop col1 (or if equal, drop the one appearing first in sorted list)
+                        feature_to_drop_from_pair = col1
+                        feature_to_keep_from_pair = col2
+                    else: # Drop col2
+                        feature_to_drop_from_pair = col2
+                        feature_to_keep_from_pair = col1
+                    
+                    print(f"       - Dropping '{feature_to_drop_from_pair}', Keeping '{feature_to_keep_from_pair}' from this pair.")
+                    to_drop_overall.add(feature_to_drop_from_pair)
+                    removed_features_overall.append(feature_to_drop_from_pair)
+                    df_to_filter = df_to_filter.drop(columns=[feature_to_drop_from_pair])
+                    dropped_in_this_iteration = True
+                    break # Restart inner loop (j) because columns changed
+            if dropped_in_this_iteration:
+                break # Restart outer loop (i) because columns changed
+
+        if not dropped_in_this_iteration:
+            break # No more features dropped in a full pass, stable now
+
+    print(f"   Collinearity removal dropped {len(removed_features_overall)} numerical features in total.")
+    return df_numerical.drop(columns=list(to_drop_overall), errors='ignore'), removed_features_overall
+
+def display_and_save_feature_importances(model, feature_names, model_name_label, output_dir, top_n=20):
+    """
+    Calculates, displays, and saves a bar plot of feature importances.
+
+    Args:
+        model: The trained model object.
+        feature_names (list): List of feature names corresponding to the model's input.
+        model_name_label (str): A label for the model (e.g., "RandomForest_LOSO_Global").
+        output_dir (str): Directory to save the plot.
+        top_n (int): Number of top features to display.
+    """
+    if hasattr(model, 'feature_importances_'): # Tree-based models
+        importances = model.feature_importances_
+    elif hasattr(model, 'coef_'): # Linear models
+        importances = np.abs(model.coef_)
+        if importances.ndim > 1 and importances.shape[0] == 1: # For some linear models coef_ is 2D
+            importances = importances.flatten()
+    else:
+        warnings.warn(f"Model {type(model).__name__} does not have 'feature_importances_' or 'coef_'. Skipping importance plot.")
+        return
+
+    if len(importances) != len(feature_names):
+        warnings.warn(f"Mismatch between number of importances ({len(importances)}) and feature names ({len(feature_names)}). Skipping importance plot.")
+        # print(f"DEBUG: Importances: {importances[:5]}")
+        # print(f"DEBUG: Feature Names: {feature_names[:5]}")
+        return
+
+    importance_df = pd.DataFrame({'feature': feature_names, 'importance': importances})
+    importance_df = importance_df.sort_values(by='importance', ascending=False).head(top_n)
+
+    print(f"\n--- Top {top_n} Feature Importances for {model_name_label} ---")
+    print(importance_df)
+
+    plt.figure(figsize=(10, max(6, top_n * 0.35))) # Adjust height based on top_n
+    sns.barplot(x='importance', y='feature', data=importance_df, palette="viridis")
+    plt.title(f'Top {top_n} Feature Importances: {model_name_label}')
+    plt.xlabel('Importance')
+    plt.ylabel('Feature')
+    plt.tight_layout()
+
+    plot_filename = f"feature_importance_{model_name_label.replace(' ', '_').lower()}.png"
+    plot_path = os.path.join(output_dir, plot_filename)
+    try:
+        plt.savefig(plot_path, dpi=150)
+        print(f"Saved feature importance plot to: {plot_path}")
+    except Exception as e:
+        warnings.warn(f"Could not save feature importance plot: {e}")
+    # plt.show() # Optionally show plot
+    plt.close()

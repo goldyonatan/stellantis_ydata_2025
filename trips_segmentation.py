@@ -111,7 +111,7 @@ def count_cycles_with_x_consecutive_stops(cycles_dict, x, stop_indicator = -1):
     return count
 
 # --- (split_rem_non_overlap_walk_forward_seg function remains the same conceptually) ---
-def split_rem_non_overlap_walk_forward_seg(cycles_natural_stops_dict, min_win=10, stop_indicator=-1, full_stop=3):
+def split_rem_non_overlap_walk_forward_seg(cycles_natural_stops_dict, min_win=10, stop_indicator=-1, full_stop=3, random_state=42):
     """Assigns segment IDs based on driving periods between stops."""
     print("\n--- Splitting Trips into Segments ---")
     print(f" - Minimum driving rows per segment (min_win): {min_win}")
@@ -161,7 +161,7 @@ def split_rem_non_overlap_walk_forward_seg(cycles_natural_stops_dict, min_win=10
                 remainder_samples = valid_driving_samples % min_win
                 # Distribute remainder using random_partition helper
                 try:
-                    partition_additions = random_partition(remainder_samples, num_segments_in_block)
+                    partition_additions = random_partition(remainder_samples, num_segments_in_block, random_state=random_state)
                 except Exception as e:
                      print(f"Warning: random_partition failed for trip {trip_id}. Distributing remainder evenly. Error: {e}")
                      # Fallback: distribute as evenly as possible
@@ -270,6 +270,7 @@ def main():
     """Loads cleaned data, finds stops, segments trips, and saves results."""
 
     # --- Configuration ---
+    RANDOM_STATE = 42
     CLEANED_DATA_PATH = r'C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\clean_df\clean_df.parquet'
     SEGMENTATION_DICT_DIR = r"C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\segmentation_dict"
     SEGMENTATION_DICT_FILENAME = 'cycles_seg_dict_v2'
@@ -319,7 +320,8 @@ def main():
         cycles_seg_dict = split_rem_non_overlap_walk_forward_seg(
             cycles_natural_stops_dict,
             min_win=MIN_SEGMENT_POINTS,
-            full_stop=CONSECUTIVE_STOPS_FOR_BREAK
+            full_stop=CONSECUTIVE_STOPS_FOR_BREAK,
+            random_state=RANDOM_STATE
         )
 
         # for cyc in cycles_seg_dict:
