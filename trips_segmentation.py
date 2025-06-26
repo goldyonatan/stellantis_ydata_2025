@@ -2,268 +2,631 @@ import numpy as np
 import pandas as pd
 import os
 import warnings
+import traceback
 
 # --- Import necessary functions from HelperFuncs ---
 try:
-    # Import the renamed/modified sort function
     from HelperFuncs import load_file, save_file, random_partition, safe_mean, sort_df_by_trip_time
 except ImportError:
     print("Error: Could not import from HelperFuncs. Ensure HelperFuncs.py is accessible.")
-    # Define placeholders
     def load_file(filepath, **kwargs): raise NotImplementedError("HelperFuncs not found")
     def save_file(data, path, file_name, format='pickle', index=False): raise NotImplementedError("HelperFuncs not found")
-    def random_partition(total, num_parts): raise NotImplementedError("HelperFuncs not found") # Assuming this exists
+    def random_partition(total, num_parts, random_state=42): raise NotImplementedError("HelperFuncs not found")
     def safe_mean(val): raise NotImplementedError("HelperFuncs not found")
     def sort_df_by_trip_time(df, trip_id_col='trip_id', time_col='timestamp'): raise NotImplementedError("HelperFuncs not found")
 
-# --- Segmentation Functions (Updated for Standard Column Names) ---
+# --- Segmentation Functions ---
 
-def find_natural_stops(df, trip_id_col='trip_id', time_col='timestamp',
-                       speed_array_col='speed_array', odo_col='current_odo',
-                       thr_speed_kph=2.0, thr_dist_km=0.05, stop_indicator=-1):
+def find_natural_stops(df, trip_id_col="trip_id", speed_array_col="speed_array",
+                       odo_col="current_odo", stop_indicator=-1,
+                       max_speed_in_stop_kph=2.0, stationary_speed_thr_kph=0.5,
+                       stationary_sample_pct_thr=0.90, thr_dist_km=0.05, debug=False):
     """
-    Identifies periods of stopping based on low speed and minimal distance traveled.
-    Uses standardized column names.
+    Detects stationary periods using a fully vectorized, index-safe method.
+    This function is significantly faster than loop-based approaches.
 
-    Args:
-        df (pd.DataFrame): Input DataFrame (should be sorted by trip_id, timestamp).
-        trip_id_col (str): Name of the trip identifier column.
-        time_col (str): Name of the timestamp column.
-        speed_array_col (str): Name of the column containing speed arrays (e.g., 1Hz).
-        odo_col (str): Name of the current odometer column.
-        thr_speed_kph (float): Speed threshold (kph) below which a stop might occur.
-        thr_dist_km (float): Distance threshold (km). If odo change is less than this,
-                             it's considered minimal movement.
-        stop_indicator (int): Value to assign to stop rows in the output array.
-
-    Returns:
-        dict: Dictionary mapping trip_id to a NumPy array indicating stops.
+    It adds a 'stop_flag' column to the DataFrame and prints summary statistics.
+    When debug=True, it prints details about rows where stop conditions mismatch.
     """
-    print("\n--- Finding Natural Stops ---")
-    df_copy = df.copy()
-    required_cols = [trip_id_col, time_col, speed_array_col, odo_col]
-    if not all(col in df.columns for col in required_cols):
-        missing = [col for col in required_cols if col not in df.columns]
-        raise ValueError(f"Input DataFrame missing required columns for find_natural_stops: {missing}")
+    print("\n--- Finding Natural Stops (Vectorized, High-Performance Logic) ---")
+    if debug:
+        print(" - Debug mode is ON. Mismatches in stop conditions will be reported.")
+    
+    processed_trips = []
+    
+    for trip_id, trip_df in df.groupby(trip_id_col, sort=False):
+        g = trip_df.reset_index(drop=True)
 
-    cycles_natural_stops_dict = {}
-    # Use groupby for potentially better performance than iterating unique cycles
-    for trip_id, trip_df in df_copy.groupby(trip_id_col):
-        if len(trip_df) < 2: # Need at least 2 points to calculate diffs
-            cycles_natural_stops_dict[trip_id] = np.zeros(len(trip_df)) # Mark all as non-stop
+        max_speed_vals = np.array([
+            np.nanmax(a) if isinstance(a, (list, np.ndarray)) and len(a) > 0 else np.inf
+            for a in g[speed_array_col]
+        ])
+        
+        pct_stationary_vals = np.array([
+            (np.sum(np.array(a) < stationary_speed_thr_kph) / len(a))
+            if isinstance(a, (list, np.ndarray)) and len(a) > 0 else 0.0
+            for a in g[speed_array_col]
+        ])
+
+        odo_diff_vals = pd.to_numeric(g[odo_col], errors="coerce").diff().to_numpy()
+        np.nan_to_num(odo_diff_vals, copy=False, nan=0.0)
+
+        cond_max_speed = (max_speed_vals < max_speed_in_stop_kph)
+        cond_pct_stationary = (pct_stationary_vals >= stationary_sample_pct_thr)
+        cond_odo_diff = (np.abs(odo_diff_vals) < thr_dist_km)
+        
+        if debug:
+            condition_sums = cond_max_speed.astype(int) + cond_pct_stationary.astype(int) + cond_odo_diff.astype(int)
+            mismatch_mask = (condition_sums == 1) | (condition_sums == 2)
+            
+            if np.any(mismatch_mask):
+                mismatch_indices = g.index[mismatch_mask]
+                reportable_mismatches = [
+                    idx for idx in mismatch_indices 
+                    if (idx > 0) or (cond_max_speed[idx] != cond_pct_stationary[idx])
+                ]
+
+                if reportable_mismatches:
+                    print(f"\n[DEBUG] Mismatches found in trip_id: {trip_id}")
+                    for idx in reportable_mismatches:
+                        odo_note = "(first row, diff is artifact)" if idx == 0 else ""
+                        print(
+                            f"  - Row index {idx}: "
+                            f"max_speed_ok={cond_max_speed[idx]} (val={max_speed_vals[idx]:.2f}), "
+                            f"pct_stationary_ok={cond_pct_stationary[idx]} (val={pct_stationary_vals[idx]:.2f}), "
+                            f"odo_diff_ok={cond_odo_diff[idx]} (val={odo_diff_vals[idx]:.4f}) {odo_note}"
+                        )
+
+        is_stop = cond_max_speed & cond_pct_stationary & cond_odo_diff
+        g["stop_flag"] = np.where(is_stop, stop_indicator, 0)
+        processed_trips.append(g)
+
+    print(f" - Stop detection complete.")
+    df_result = pd.concat(processed_trips, ignore_index=True)
+
+    # --- Add summary statistics ---
+    print("\n--- Natural Stop Statistics ---")
+    total_rows = len(df_result)
+    total_natural_stops = (df_result["stop_flag"] == stop_indicator).sum()
+    total_trips = df_result[trip_id_col].nunique()
+    trips_with_stops = df_result[df_result["stop_flag"] == stop_indicator][trip_id_col].nunique()
+    avg_stops_per_trip = total_natural_stops / total_trips if total_trips > 0 else 0
+
+    print(f" - Total rows processed: {total_rows:,}")
+    print(f" - Total natural stops detected: {total_natural_stops:,} ({total_natural_stops / total_rows:.2%})")
+    print(f" - Total unique trips: {total_trips:,}")
+    print(f" - Trips containing at least one stop: {trips_with_stops:,} ({trips_with_stops / total_trips:.2%})")
+    print(f" - Average natural stops per trip (overall): {avg_stops_per_trip:.2f}")
+    
+    return df_result
+
+
+def incorporate_gap_flags(df, gap_flag_col='is_start_after_gap', stop_flag_col='stop_flag',
+                          trip_id_col='trip_id', stop_indicator=-1, 
+                          gap_indicator=-2, stop_and_gap_indicator=-3):
+    """
+    Updates the 'stop_flag' column to incorporate time gap information and prints a summary.
+    Operates directly on the DataFrame.
+    """
+    print("\n--- Incorporating Time Gap Flags into Segmentation ---")
+
+    if gap_flag_col not in df.columns:
+        warnings.warn(f"Warning: Gap flag column '{gap_flag_col}' not found. Skipping this step.")
+        return df
+
+    # --- Capture initial state for summary ---
+    total_rows = len(df)
+    total_trips = df[trip_id_col].nunique()
+    initial_natural_stops = (df[stop_flag_col] == stop_indicator).sum()
+    initial_gaps = (df[gap_flag_col] == 1).sum()
+
+    # --- Core Logic ---
+    stop_and_gap_mask = (df[gap_flag_col] == 1) & (df[stop_flag_col] == stop_indicator)
+    gap_only_mask = (df[gap_flag_col] == 1) & (df[stop_flag_col] != stop_indicator)
+
+    df.loc[stop_and_gap_mask, stop_flag_col] = stop_and_gap_indicator
+    df.loc[gap_only_mask, stop_flag_col] = gap_indicator
+    
+    # --- Capture final state for summary ---
+    final_stop_and_gap = (df[stop_flag_col] == stop_and_gap_indicator).sum()
+    final_gap_only = (df[stop_flag_col] == gap_indicator).sum()
+    final_natural_stops = (df[stop_flag_col] == stop_indicator).sum()
+    
+    trips_with_any_gap_flag = df[df[stop_flag_col].isin([gap_indicator, stop_and_gap_indicator])][trip_id_col].nunique()
+
+    # --- Print Summary ---
+    print("\n--- Gap Flag Incorporation Summary ---")
+    print(f" - Total rows processed: {total_rows:,}")
+    print(f" - Total unique trips: {total_trips:,}")
+    print(f" - Initial 'is_start_after_gap' flags found: {initial_gaps:,}")
+    print(f" - Trips affected by gaps: {trips_with_any_gap_flag:,} ({trips_with_any_gap_flag/total_trips:.2%})")
+    print("-" * 20)
+    print("Breakdown of New Gap Flags:")
+    print(f" - Rows marked as 'Gap Only' [-2]: {final_gap_only:,} ({final_gap_only/total_rows:.2%})")
+    print(f"   (Gaps that occurred during driving)")
+    print(f" - Rows marked as 'Stop & Gap' [-3]: {final_stop_and_gap:,} ({final_stop_and_gap/total_rows:.2%})")
+    print(f"   (Gaps that coincided with a natural stop)")
+    print("-" * 20)
+    print("Impact on Natural Stops:")
+    print(f" - Initial natural stops: {initial_natural_stops:,}")
+    print(f" - Natural stops converted to 'Stop & Gap': {final_stop_and_gap:,}")
+    print(f" - Remaining 'Natural Stop Only' [-1]: {final_natural_stops:,}")
+    
+    return df
+
+# ==============================================================================
+# --- New, Rule-Based Segmentation Functions (V5 - Constructive Logic) ---
+# ==============================================================================
+
+def find_valid_driving_blocks_v5(flags, min_win, full_stop):
+    """
+    (Unchanged from v4) Scans the trip's flags to find continuous blocks of driving
+    that adhere to the strict start/end/content rules.
+    """
+    blocks = []
+    i = 0
+    n_samples = len(flags)
+    while i < n_samples:
+        if flags[i] not in [0, -2]:
+            i += 1
             continue
-
-        # Compute mean speed for each row using the safe_mean helper
-        try:
-            mean_speeds = trip_df[speed_array_col].apply(safe_mean).values
-        except Exception as e:
-             print(f"Warning: Error calculating mean speed for trip {trip_id}. Skipping stop detection. Error: {e}")
-             cycles_natural_stops_dict[trip_id] = np.zeros(len(trip_df))
-             continue
-
-        # Compute odometer changes between consecutive rows
-        # Ensure odo is numeric first
-        trip_df[odo_col] = pd.to_numeric(trip_df[odo_col], errors='coerce')
-        # Use diff() which handles first NaN correctly
-        odo_changes = trip_df[odo_col].diff().values # odo_changes[0] will be NaN
-
-        # Initialize flags array with zeros
-        flags = np.zeros(len(trip_df))
-
-        # Iterate through the rows to find stop sequences
-        i = 0
-        while i < len(trip_df):
-            # Check if speed is below threshold (handle potential NaN mean speed)
-            if pd.isna(mean_speeds[i]) or mean_speeds[i] >= thr_speed_kph:
-                i += 1
-            else:
-                # Start a potential stop sequence
-                j = i + 1
-                # Extend the sequence
-                # Check j bounds, speed condition, and odo change condition
-                # odo_changes[j] corresponds to the change *between* row j-1 and row j
-                while (j < len(trip_df) and
-                       (pd.isna(mean_speeds[j]) or mean_speeds[j] < thr_speed_kph) and
-                       (pd.isna(odo_changes[j]) or abs(odo_changes[j]) < thr_dist_km)): # Check abs() change < threshold
-                    j += 1
-
-                # Flag all rows in the sequence [i, j)
-                flags[i:j] = stop_indicator
-                # Move to the next potential sequence start
-                i = j
-
-        cycles_natural_stops_dict[trip_id] = flags
-
-    print(f" - Stop detection complete for {len(cycles_natural_stops_dict)} trips.")
-    return cycles_natural_stops_dict
-
-def count_cycles_with_x_consecutive_stops(cycles_dict, x, stop_indicator = -1):
-    count = 0
-    for cycle_id, arr in cycles_dict.items():
-        # Iterate through all possible starting indices where a block of x elements can fit.
-        found = False
-        for i in range(len(arr) - x + 1):
-            if np.all(arr[i:i+x] == stop_indicator):
-                found = True
+        block_start = i
+        consecutive_stops = 0
+        j = block_start
+        while j < n_samples:
+            flag = flags[j]
+            if j > block_start and flag in [-2, -3]: break
+            if flag == -1: consecutive_stops += 1
+            else: consecutive_stops = 0
+            if consecutive_stops >= full_stop:
+                j -= (full_stop - 1)
                 break
-        if found:
-            count += 1
-    return count
+            j += 1
+        potential_end = j
+        block_end = potential_end
+        while block_end > block_start and flags[block_end - 1] != 0:
+            block_end -= 1
+        driving_samples_in_block = np.sum(np.isin(flags[block_start:block_end], [0, -2]))
+        if driving_samples_in_block >= min_win:
+            blocks.append((block_start, block_end))
+        i = potential_end
+    return blocks
 
-# --- (split_rem_non_overlap_walk_forward_seg function remains the same conceptually) ---
-def split_rem_non_overlap_walk_forward_seg(cycles_natural_stops_dict, min_win=10, stop_indicator=-1, full_stop=3, random_state=42):
-    """Assigns segment IDs based on driving periods between stops."""
-    print("\n--- Splitting Trips into Segments ---")
+
+def partition_and_label_block_v5(segment_labels, flags, block_start, block_end, 
+                                 min_win, random_state, start_segment_id):
+    """
+    Uses a constructive approach to build segments sample-by-sample,
+    ensuring all rules are met without complex post-correction. This is the
+    most robust and logically sound version.
+    """
+    block_flags = flags[block_start:block_end]
+    driving_samples_in_block = np.sum(np.isin(block_flags, [0, -2]))
+    
+    num_segments = driving_samples_in_block // min_win
+    if num_segments == 0:
+        return start_segment_id
+
+    remainder = driving_samples_in_block % min_win
+    try:
+        partition_additions = random_partition(remainder, num_segments, random_state)
+    except Exception:
+        base_add = remainder // num_segments
+        extra_add = remainder % num_segments
+        partition_additions = [base_add + 1] * extra_add + [base_add] * (num_segments - extra_add)
+
+    target_lengths = [min_win + add for add in partition_additions]
+    
+    current_segment_id = start_segment_id
+    cursor_in_block = 0
+
+    for target_len in target_lengths:
+        # 1. Find a valid start for the segment (skip leading stops)
+        segment_start_cursor = cursor_in_block
+        while segment_start_cursor < len(block_flags) and block_flags[segment_start_cursor] == -1:
+            segment_start_cursor += 1
+        
+        if segment_start_cursor >= len(block_flags):
+            break # No more data in block to start a segment
+
+        # 2. Build the segment constructively
+        driving_samples_counted = 0
+        segment_end_cursor = segment_start_cursor
+        
+        while segment_end_cursor < len(block_flags) and driving_samples_counted < target_len:
+            flag = block_flags[segment_end_cursor]
+            if flag in [0, -2]:
+                driving_samples_counted += 1
+            segment_end_cursor += 1
+        
+        # 3. Validate the constructed segment
+        # Check if we found enough driving samples (could fail if block ends early)
+        if driving_samples_counted >= min_win:
+            # The segment is valid by construction.
+            # The last driving sample increment guarantees it ends correctly.
+            start_idx_global = block_start + segment_start_cursor
+            end_idx_global = block_start + segment_end_cursor
+            
+            # Label only the driving points (flag == 0) within the valid segment range,
+            # preserving the original non-zero flags (-1, -2, -3).
+            segment_range_indices = np.arange(start_idx_global, end_idx_global)
+            # Identify which of the original flags in this range were 0
+            driving_points_mask = (flags[segment_range_indices] == 0)
+            # Apply the new segment ID only to those points
+            segment_labels[segment_range_indices[driving_points_mask]] = current_segment_id
+            
+            current_segment_id += 1
+        
+        # 4. Advance the main cursor to the end of the last attempted segment
+        cursor_in_block = segment_end_cursor
+
+    return current_segment_id
+
+
+def split_rem_non_overlap_walk_forward_seg(df, trip_id_col='trip_id', stop_flag_col='stop_flag',
+                                              min_win=10, full_stop=3, random_state=42):
+    """
+    Assigns segment IDs based on driving periods, using the V5 constructive logic
+    for the most robust and correct rule enforcement.
+    """
+    print("\n--- Splitting Trips into Segments (V5 - Constructive Logic) ---")
     print(f" - Minimum driving rows per segment (min_win): {min_win}")
-    print(f" - Consecutive stops indicating segment end (full_stop): {full_stop}")
+    print(f" - Consecutive non-driving events indicating segment end (full_stop): {full_stop}")
 
-    cycles_natural_stops_dict_copy = cycles_natural_stops_dict.copy()
-    processed_cycles = 0
+    trips_seg_dict = {}
     total_segments_created = 0
 
-    for trip_id, stop_flags in cycles_natural_stops_dict_copy.items():
-        n_samples_cycle = len(stop_flags)
-        segment_labels = stop_flags.copy().astype(float) # Use float to allow NaNs or keep int if preferred
-        current_segment_id = 1.0 # Start segment IDs at 1
+    for trip_id, trip_df in df.groupby(trip_id_col, sort=False):
+        flags = trip_df[stop_flag_col].values
+        segment_labels = flags.copy().astype(int)
+        current_segment_id = 1
+        
+        valid_blocks = find_valid_driving_blocks_v5(flags, min_win, full_stop)
+        
+        for block_start, block_end in valid_blocks:
+            next_id = partition_and_label_block_v5(
+                segment_labels,
+                flags,
+                block_start,
+                block_end,
+                min_win,
+                random_state,
+                current_segment_id
+            )
+            current_segment_id = next_id
+        
+        trips_seg_dict[trip_id] = segment_labels
+        total_segments_created += (current_segment_id - 1)
 
-        i = 0
-        while i < n_samples_cycle:
-            # Find start of a driving block (skip initial stops)
-            if segment_labels[i] == stop_indicator:
-                i += 1
-                continue
-            driving_block_start = i
+    print(f" - Segmentation complete for {len(df[trip_id_col].unique()):,} trips.")
+    print(f" - Total segments created: {total_segments_created:,}")
+    return trips_seg_dict
 
-            # Find end of the driving block
-            consecutive_stops = 0
-            driving_block_end = driving_block_start # End index (exclusive)
-            valid_driving_samples = 0
-            j = driving_block_start
-            while j < n_samples_cycle:
-                if segment_labels[j] == stop_indicator:
-                    consecutive_stops += 1
-                else:
-                    consecutive_stops = 0
-                    valid_driving_samples += 1 # Count only non-stop samples
+def evaluate_segmentation_rules(df, trips_seg_dict, stop_flag_col='stop_flag', 
+                                trip_id_col='trip_id', min_win=10, full_stop=3, 
+                                max_print=10):
+    """
+    Evaluates the segmentation output against a comprehensive set of logical rules.
+    This version uses a robust method to define the "segment span" based on the
+    explicit rules provided.
 
-                # End block if enough consecutive stops are found
-                if consecutive_stops >= full_stop:
-                    driving_block_end = j - consecutive_stops + 1 # End index is start of full stop sequence
+    Rules Checked (as per user specification):
+    1.  **Start Rule:** A segment's span must start with a driving sample (0) or a gap-start (-2).
+        - Valid starts: `[0,...]`, `[-2, 0,...]`, `[-2, -1, 0,...]`
+        - Invalid starts: `[-1, 0,...]`, `[-3, 0,...]`
+    2.  **End Rule:** A segment's span must end with a driving sample (0).
+    3.  **Mid-Segment Rule:** The middle part of a segment cannot contain a gap flag (-2 or -3).
+    4.  **Min Length Rule:** Must contain at least `min_win` driving samples (flags 0 or -2).
+    5.  **Max Length Rule:** Must contain no more than `2 * min_win - 1` driving samples.
+    6.  **Consecutive Stops Rule:** Cannot contain `full_stop` or more consecutive stop flags (-1).
+    """
+    print("\n--- Evaluating Adherence to All Segmentation Rules ---")
+    print(f" - Evaluation params: min_win={min_win}, full_stop={full_stop}")
+    
+    violations = {}
+    
+    df_flags = df.set_index(trip_id_col)[stop_flag_col]
+
+    for trip_id, labels in trips_seg_dict.items():
+        trip_violations = []
+        trip_flags = df_flags.loc[trip_id].values
+        
+        segment_ids = np.unique(labels[labels > 0])
+        
+        for seg_id in segment_ids:
+            labeled_indices = np.where(labels == seg_id)[0]
+            if len(labeled_indices) == 0: continue
+            
+            first_labeled_idx = labeled_indices[0]
+            last_labeled_idx = labeled_indices[-1]
+
+            # --- FINAL CORRECTED LOGIC (V8): The "Last Anchor" Principle ---
+
+            # 1. Define the "search space" for the prefix. This space starts after the
+            #    previous segment or hard boundary and ends right before the current segment's core.
+            search_space_start_idx = 0
+            for i in range(first_labeled_idx - 1, -1, -1):
+                # A full_stop sequence is a hard boundary.
+                if i >= full_stop - 1 and np.all(trip_flags[i - (full_stop - 1) : i + 1] == -1):
+                    search_space_start_idx = i + 1
                     break
-                j += 1
-            else: # If loop finishes without breaking (end of trip)
-                driving_block_end = n_samples_cycle
+                # Other hard boundaries.
+                if labels[i] > 0 or trip_flags[i] in [0, -3]:
+                    search_space_start_idx = i + 1
+                    break
+                search_space_start_idx = i
 
-            # Process the identified driving block [driving_block_start, driving_block_end)
-            num_segments_in_block = valid_driving_samples // min_win
-
-            if num_segments_in_block > 0:
-                remainder_samples = valid_driving_samples % min_win
-                # Distribute remainder using random_partition helper
-                try:
-                    partition_additions = random_partition(remainder_samples, num_segments_in_block, random_state=random_state)
-                except Exception as e:
-                     print(f"Warning: random_partition failed for trip {trip_id}. Distributing remainder evenly. Error: {e}")
-                     # Fallback: distribute as evenly as possible
-                     base_add = remainder_samples // num_segments_in_block
-                     extra_add = remainder_samples % num_segments_in_block
-                     partition_additions = [base_add + 1] * extra_add + [base_add] * (num_segments_in_block - extra_add)
-
-
-                # Assign segment IDs within the block
-                current_pos_in_block = driving_block_start
-                for addition in partition_additions:
-                    segment_len = min_win + addition
-                    labeled_driving_samples = 0
-                    k = current_pos_in_block
-                    segment_end_pos = k # Track where the segment actually ends
-                    while labeled_driving_samples < segment_len and k < driving_block_end:
-                        if segment_labels[k] != stop_indicator:
-                            segment_labels[k] = current_segment_id
-                            labeled_driving_samples += 1
-                        segment_end_pos = k + 1 # Move end position
-                        k += 1
-                    current_pos_in_block = segment_end_pos # Start next segment after this one ends
-                    current_segment_id += 1
-                    total_segments_created += 1
-
-            # Move main loop index past the processed block (or the full stop sequence)
-            i = driving_block_end + (full_stop if consecutive_stops >= full_stop else 0)
-
-        # Update the dictionary with the array containing segment labels
-        cycles_natural_stops_dict_copy[trip_id] = segment_labels.astype(int) # Convert back to int if desired
-        processed_cycles += 1
-
-    print(f" - Segmentation complete for {processed_cycles} trips.")
-    print(f" - Total segments created: {total_segments_created}")
-    return cycles_natural_stops_dict_copy
-
-def find_natural_stops(df, trip_id_col='trip_id', time_col='timestamp',
-                       speed_array_col='speed_array', odo_col='current_odo',
-                       thr_speed_kph=2.0, thr_dist_km=0.05, stop_indicator=-1): # <-- Added parameters here
-    """
-    Identifies periods of stopping based on low speed and minimal distance traveled.
-    Uses standardized column names passed as arguments.
-
-    Args:
-        df (pd.DataFrame): Input DataFrame (should be sorted by trip_id, timestamp).
-        trip_id_col (str): Name of the trip identifier column.
-        time_col (str): Name of the timestamp column.
-        speed_array_col (str): Name of the column containing speed arrays (e.g., 1Hz).
-        odo_col (str): Name of the current odometer column.
-        thr_speed_kph (float): Speed threshold (kph) below which a stop might occur.
-        thr_dist_km (float): Distance threshold (km). If odo change is less than this,
-                             it's considered minimal movement.
-        stop_indicator (int): Value to assign to stop rows in the output array.
-
-    Returns:
-        dict: Dictionary mapping trip_id to a NumPy array indicating stops.
-    """
-    print("\n--- Finding Natural Stops ---")
-    required_cols = [trip_id_col, time_col, speed_array_col, odo_col]
-    if not all(col in df.columns for col in required_cols):
-        missing = [col for col in required_cols if col not in df.columns]
-        raise ValueError(f"Input DataFrame missing required columns for find_natural_stops: {missing}")
-
-    # Ensure data is sorted (important for diff calculations)
-    df_sorted = df.sort_values([trip_id_col, time_col]).copy()
-    print(f" - Processing {df_sorted[trip_id_col].nunique()} trips...")
-
-    cycles_natural_stops_dict = {}
-    for trip_id, trip_df in df_sorted.groupby(trip_id_col):
-        if len(trip_df) < 2:
-            cycles_natural_stops_dict[trip_id] = np.zeros(len(trip_df))
-            continue
-
-        try:
-            mean_speeds = trip_df[speed_array_col].apply(safe_mean).values
-        except Exception as e:
-             print(f"Warning: Error calculating mean speed for trip {trip_id}. Skipping stop detection. Error: {e}")
-             cycles_natural_stops_dict[trip_id] = np.zeros(len(trip_df))
-             continue
-
-        trip_df[odo_col] = pd.to_numeric(trip_df[odo_col], errors='coerce')
-        odo_changes = trip_df[odo_col].diff().values
-
-        flags = np.zeros(len(trip_df))
-        i = 0
-        while i < len(trip_df):
-            if pd.isna(mean_speeds[i]) or mean_speeds[i] >= thr_speed_kph:
-                i += 1
+            # 2. Find the "anchor" of the segment. The anchor is the LAST -2 flag within the search space.
+            #    If no -2 exists, the segment is anchored by its first labeled point (a 0).
+            anchor_idx = -1
+            for i in range(first_labeled_idx - 1, search_space_start_idx - 1, -1):
+                if trip_flags[i] == -2:
+                    anchor_idx = i
+                    break
+            
+            # 3. Determine the final segment start index.
+            if anchor_idx != -1:
+                # An anchor was found. The segment span starts at this anchor.
+                segment_start_idx = anchor_idx
             else:
-                j = i + 1
-                while (j < len(trip_df) and
-                       (pd.isna(mean_speeds[j]) or mean_speeds[j] < thr_speed_kph) and
-                       (pd.isna(odo_changes[j]) or abs(odo_changes[j]) < thr_dist_km)):
-                    j += 1
-                flags[i:j] = stop_indicator
-                i = j
+                # No -2 anchor. The segment must start with a 0, which is the first labeled point.
+                segment_start_idx = first_labeled_idx
 
-        cycles_natural_stops_dict[trip_id] = flags
+            # Define the final, correct segment span.
+            segment_span_indices = np.arange(segment_start_idx, last_labeled_idx + 1)
+            segment_span_flags = trip_flags[segment_span_indices]
+            
+            if len(segment_span_flags) == 0: continue
 
-    print(f" - Stop detection complete for {len(cycles_natural_stops_dict)} trips.")
-    return cycles_natural_stops_dict
+            # --- Apply Rules to the Correctly Identified Span ---
 
+            # Rule 1: First Sample Check
+            if segment_span_flags[0] in [-1, -3]:
+                trip_violations.append(f"Segment {seg_id} violates START rule: Span starts with flag {segment_span_flags[0]} at index {segment_start_idx}.")
+
+            # Rule 2: Last Sample Check
+            if segment_span_flags[-1] in [-1, -2, -3]:
+                trip_violations.append(f"Segment {seg_id} violates END rule: Ends with flag {segment_span_flags[-1]} at index {last_labeled_idx}.")
+
+            # Rule 3: Mid-Segment Gap Check
+            if len(segment_span_flags) > 2:
+                mid_flags = segment_span_flags[1:-1]
+                if np.any(np.isin(mid_flags, [-2, -3])):
+                    violating_idx_local = 1 + np.where(np.isin(mid_flags, [-2, -3]))[0][0]
+                    violating_idx_global = segment_span_indices[violating_idx_local]
+                    trip_violations.append(f"Segment {seg_id} violates MID-SEGMENT rule: Contains gap flag {trip_flags[violating_idx_global]} at index {violating_idx_global}.")
+
+            # Rules 4 & 5: Length Checks
+            driving_samples_count = np.sum(np.isin(segment_span_flags, [0, -2]))
+            max_len = 2 * min_win - 1
+            if driving_samples_count < min_win:
+                trip_violations.append(f"Segment {seg_id} violates MIN LENGTH rule: Has {driving_samples_count} driving samples, less than min_win={min_win}.")
+            if driving_samples_count > max_len:
+                trip_violations.append(f"Segment {seg_id} violates MAX LENGTH rule: Has {driving_samples_count} driving samples, more than max_allowed={max_len}.")
+
+            # Rule 6: Consecutive Stops Check
+            max_consecutive_stops = 0
+            current_consecutive_stops = 0
+            for flag in segment_span_flags:
+                if flag == -1:
+                    current_consecutive_stops += 1
+                else:
+                    max_consecutive_stops = max(max_consecutive_stops, current_consecutive_stops)
+                    current_consecutive_stops = 0
+            max_consecutive_stops = max(max_consecutive_stops, current_consecutive_stops)
+            
+            if max_consecutive_stops >= full_stop:
+                trip_violations.append(f"Segment {seg_id} violates CONSECUTIVE STOP rule: Found a sequence of {max_consecutive_stops} stops, >= full_stop={full_stop}.")
+
+        if trip_violations:
+            violations[trip_id] = trip_violations
+            
+    # --- Reporting Phase ---
+    if not violations:
+        print("✅ Success! All segments adhere to the defined rules.")
+    else:
+        print(f"❌ Found violations in {len(violations)} trips:")
+        for i, (trip_id, viol_list) in enumerate(violations.items()):
+            if i >= max_print:
+                print(f"\n... and {len(violations) - max_print} more trips with violations.")
+                break
+            
+            print(f"\n--- Violations in Trip ID: {trip_id} ---")
+            for v in viol_list:
+                print(f"  - {v}")
+            
+            print("\n  Full trip data for diagnostics:")
+            trip_labels = trips_seg_dict[trip_id]
+            trip_flags = df_flags.loc[trip_id].values
+            comparison_df = pd.DataFrame({'Segment_Label': trip_labels, 'Stop_Flag': trip_flags})
+            with pd.option_context('display.max_rows', None, 'display.max_columns', None, 'display.width', 100):
+                print(comparison_df)
+            print("-" * (len(str(trip_id)) + 28))
+
+    return violations
+
+def summarize_segmentation_results(df, trips_seg_dict, trip_id_col='trip_id', stop_flag_col='stop_flag', full_stop=3):
+    """
+    Analyzes the segmentation output and prints a detailed summary.
+    This function is now 100% consistent with the evaluation logic, defining
+    segment length by its full, valid span.
+    """
+    print("\n" + "="*50)
+    print("--- Detailed Segmentation Results Summary (Rule-Consistent) ---")
+    print("="*50)
+
+    if not trips_seg_dict:
+        print("The segmentation dictionary is empty. No results to summarize.")
+        return
+
+    # --- Data Preparation ---
+    num_total_trips = len(trips_seg_dict)
+    all_labels_flat = np.concatenate(list(trips_seg_dict.values()))
+    df_flags = df.set_index(trip_id_col)[stop_flag_col]
+    
+    segments_per_trip = [np.max(labels) if np.any(labels > 0) else 0 for labels in trips_seg_dict.values()]
+    segments_per_trip_ser = pd.Series(segments_per_trip)
+
+    # --- 1. High-Level Trip & Segment Counts ---
+    print("\n--- I. Overall Trip & Segment Statistics ---")
+    total_segments = int(segments_per_trip_ser.sum())
+    trips_with_segments = segments_per_trip_ser[segments_per_trip_ser > 0]
+    num_trips_with_segments = len(trips_with_segments)
+    num_trips_without_segments = num_total_trips - num_trips_with_segments
+
+    print(f" - Total trips processed: {num_total_trips:,}")
+    print(f" - Total segments created: {total_segments:,}")
+    print(f" - Trips containing at least one segment: {num_trips_with_segments:,} ({num_trips_with_segments/num_total_trips:.2%})")
+    print(f" - Trips with NO segments (unsegmented): {num_trips_without_segments:,} ({num_trips_without_segments/num_total_trips:.2%})")
+
+    # --- 2. Segments Per Trip Distribution ---
+    print("\n--- II. Segments-Per-Trip Distribution (for segmented trips) ---")
+    if num_trips_with_segments > 0:
+        print(f" - Average segments per trip (overall): {segments_per_trip_ser.mean():.2f}")
+        print(f" - Average segments per trip (segmented only): {trips_with_segments.mean():.2f}")
+        print(f" - Trip with maximum segments: {int(trips_with_segments.max())} segments")
+        print("\nDistribution of segment counts:")
+        print(trips_with_segments.describe().to_string())
+    else:
+        print("No trips were segmented.")
+
+    # --- 3. Row-Level Label Breakdown ---
+    print("\n--- III. Final Row-Level Label Breakdown ---")
+    total_rows = len(all_labels_flat)
+    segmented_rows = (all_labels_flat > 0).sum()
+    unsegmented_driving_rows = (all_labels_flat == 0).sum()
+    stop_rows = (all_labels_flat == -1).sum()
+    gap_only_rows = (all_labels_flat == -2).sum()
+    stop_and_gap_rows = (all_labels_flat == -3).sum()
+    
+    print(f"Total rows across all trips: {total_rows:,}\n")
+    print(f" - Rows assigned to a driving segment (>0): {segmented_rows:>10,} ({segmented_rows/total_rows:8.2%})")
+    print(f" - Rows of unsegmented driving data (0): {unsegmented_driving_rows:>10,} ({unsegmented_driving_rows/total_rows:8.2%})")
+    print(f" - Rows marked as 'Natural Stop Only' (-1): {stop_rows:>10,} ({stop_rows/total_rows:8.2%})")
+    print(f" - Rows marked as 'Gap Only' (-2): {gap_only_rows:>10,} ({gap_only_rows/total_rows:8.2%})")
+    print(f" - Rows marked as 'Stop & Gap' (-3): {stop_and_gap_rows:>10,} ({stop_and_gap_rows/total_rows:8.2%})")
+
+    # --- 4. Segment Length Distribution (Corrected Logic) ---
+    print("\n--- IV. Segment Span Length (in rows) Distribution ---")
+    if total_segments > 0:
+        all_segment_span_lengths = []
+        # Iterate through each trip to calculate segment span lengths individually.
+        for trip_id, labels in trips_seg_dict.items():
+            trip_flags = df_flags.loc[trip_id].values
+            segment_ids = np.unique(labels[labels > 0])
+            
+            for seg_id in segment_ids:
+                labeled_indices = np.where(labels == seg_id)[0]
+                if len(labeled_indices) == 0: continue
+                
+                first_labeled_idx = labeled_indices[0]
+                last_labeled_idx = labeled_indices[-1]
+
+                # Use the same "Last Anchor" logic as the evaluation function
+                search_space_start_idx = 0
+                for i in range(first_labeled_idx - 1, -1, -1):
+                    if i >= full_stop - 1 and np.all(trip_flags[i - (full_stop - 1) : i + 1] == -1):
+                        search_space_start_idx = i + 1; break
+                    if labels[i] > 0 or trip_flags[i] in [0, -3]:
+                        search_space_start_idx = i + 1; break
+                    search_space_start_idx = i
+                
+                anchor_idx = -1
+                for i in range(first_labeled_idx - 1, search_space_start_idx - 1, -1):
+                    if trip_flags[i] == -2: anchor_idx = i; break
+                
+                segment_start_idx = anchor_idx if anchor_idx != -1 else first_labeled_idx
+                
+                span_length = (last_labeled_idx - segment_start_idx) + 1
+                all_segment_span_lengths.append(span_length)
+        
+        segment_lengths_ser = pd.Series(all_segment_span_lengths)
+        print("Distribution of segment span lengths (in rows):")
+        print(segment_lengths_ser.describe().to_string())
+    else:
+        print("No segments were created to analyze length.")
+        
+    print("\n" + "="*50)
+    print("--- End of Summary ---")
+    print("="*50)
+
+def find_and_print_trip_with_max_segment(df, trips_seg_dict, trip_id_col='trip_id', stop_flag_col='stop_flag', full_stop=3):
+    """
+    Finds the trip containing the single longest segment by its full span length
+    and prints its details. This function is now 100% consistent with the
+    evaluation logic.
+    """
+    print("\n--- Finding Trip with Maximum Segment Span Length ---")
+
+    if not trips_seg_dict:
+        print("Segmentation dictionary is empty.")
+        return
+
+    max_span_len_found = 0
+    trip_id_with_max_len = None
+    seg_id_with_max_len = None
+    
+    df_flags = df.set_index(trip_id_col)[stop_flag_col]
+
+    # Iterate through each trip to find the segment with the longest span
+    for trip_id, labels in trips_seg_dict.items():
+        trip_flags = df_flags.loc[trip_id].values
+        segment_ids = np.unique(labels[labels > 0])
+
+        for seg_id in segment_ids:
+            labeled_indices = np.where(labels == seg_id)[0]
+            if len(labeled_indices) == 0: continue
+            
+            first_labeled_idx = labeled_indices[0]
+            last_labeled_idx = labeled_indices[-1]
+
+            # Use the same "Last Anchor" logic as the evaluation function
+            search_space_start_idx = 0
+            for i in range(first_labeled_idx - 1, -1, -1):
+                if i >= full_stop - 1 and np.all(trip_flags[i - (full_stop - 1) : i + 1] == -1):
+                    search_space_start_idx = i + 1; break
+                if labels[i] > 0 or trip_flags[i] in [0, -3]:
+                    search_space_start_idx = i + 1; break
+                search_space_start_idx = i
+            
+            anchor_idx = -1
+            for i in range(first_labeled_idx - 1, search_space_start_idx - 1, -1):
+                if trip_flags[i] == -2: anchor_idx = i; break
+            
+            segment_start_idx = anchor_idx if anchor_idx != -1 else first_labeled_idx
+            
+            current_span_len = (last_labeled_idx - segment_start_idx) + 1
+            
+            if current_span_len > max_span_len_found:
+                max_span_len_found = current_span_len
+                trip_id_with_max_len = trip_id
+                seg_id_with_max_len = seg_id
+
+    if trip_id_with_max_len is None:
+        print("No trips with segments were found.")
+        return
+
+    # --- Reporting Phase ---
+    print(f"\nTrip with the longest segment span: '{trip_id_with_max_len}'")
+    print(f"Segment ID with the longest span: {seg_id_with_max_len}")
+    print(f"Length of its span: {max_span_len_found} rows")
+
+    # Get the specific trip's data from the DataFrame
+    trip_data = df[df[trip_id_col] == trip_id_with_max_len]
+    
+    # Get the stop flags and segment labels for this trip
+    stop_flags_for_trip = trip_data[stop_flag_col].values
+    segment_labels_for_trip = trips_seg_dict[trip_id_with_max_len]
+
+    # Create a DataFrame for easy side-by-side comparison
+    comparison_df = pd.DataFrame({
+        'Segment_Label': segment_labels_for_trip,
+        'Stop_Flag': stop_flags_for_trip
+    })
+
+    print("\nSegment labels and stop flags for this trip (side-by-side):")
+    with pd.option_context('display.max_rows', None, 'display.max_columns', None):
+        print(comparison_df)
 
 # --- Main Execution Logic ---
 def main():
@@ -273,21 +636,20 @@ def main():
     RANDOM_STATE = 42
     CLEANED_DATA_PATH = r'C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\clean_df\clean_df.parquet'
     SEGMENTATION_DICT_DIR = r"C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\segmentation_dict"
-    SEGMENTATION_DICT_FILENAME = 'cycles_seg_dict_v2'
+    SEGMENTATION_DICT_FILENAME = 'trips_seg_dict_v7'
     OUTPUT_FORMAT = 'pickle'
     
-    # Parameters for stop finding and segmentation
-    STOP_SPEED_KPH = 1.5 # Speed threshold for stops
-    STOP_DIST_KM = 0.05 # Odo distance threshold for stops
-    MIN_SEGMENT_POINTS = 10 # Minimum number of non-stop data points for a valid segment
-    CONSECUTIVE_STOPS_FOR_BREAK = 3 # Number of consecutive stop points to end a driving block
+    MIN_SEGMENT_POINTS = 10
+    CONSECUTIVE_STOPS_FOR_BREAK = 3
     # --------------------
 
-    # --- Standard Column Names (Must match output of preprocessing script) ---
+    # --- Standard Column Names ---
     TRIP_ID_COL = 'trip_id'
     TIME_COL = 'timestamp'
     ODO_COL = 'current_odo'
     SPEED_ARRAY_COL = 'speed_array'
+    GAP_FLAG_COL = 'is_start_after_gap'
+    STOP_FLAG_COL = 'stop_flag'
     # --------------------
 
     print(f"--- Starting Trip Segmentation Pipeline ---")
@@ -301,37 +663,73 @@ def main():
         if not isinstance(df_clean, pd.DataFrame): raise TypeError("Loaded data is not a DataFrame.")
         print(f"Loaded cleaned data with shape: {df_clean.shape}")
 
-        # 2. Ensure Sorting using the Helper Function
+        # 2. Ensure Sorting
         print(f"\n--- Sorting data by {TRIP_ID_COL}, {TIME_COL} ---")
-        # Call the helper function using the standard column names
         df_clean = sort_df_by_trip_time(df_clean, trip_id_col=TRIP_ID_COL, time_col=TIME_COL)
         print("Data sorting complete.")
 
-        # 3. Find Natural Stops
-        # Pass standard column names
-        cycles_natural_stops_dict = find_natural_stops(
-            df_clean, # Pass the sorted DataFrame
-            trip_id_col=TRIP_ID_COL, time_col=TIME_COL,
-            speed_array_col=SPEED_ARRAY_COL, odo_col=ODO_COL,
-            thr_speed_kph=STOP_SPEED_KPH, thr_dist_km=STOP_DIST_KM
+        # 3. Find Natural Stops using the new high-performance, vectorized function
+        # This now returns a DataFrame with a 'stop_flag' column.
+        # To debug stop detection, set debug=True
+        df_clean = find_natural_stops(
+            df_clean,
+            trip_id_col=TRIP_ID_COL,
+            speed_array_col=SPEED_ARRAY_COL,
+            odo_col=ODO_COL,
+            debug=False  # Set to True to print mismatch details
         )
 
-        # 4. Segment Trips
-        cycles_seg_dict = split_rem_non_overlap_walk_forward_seg(
-            cycles_natural_stops_dict,
+        # 4. Incorporate Gap Flags directly into the DataFrame
+        df_clean = incorporate_gap_flags(
+            df=df_clean,
+            gap_flag_col=GAP_FLAG_COL,
+            stop_flag_col=STOP_FLAG_COL,
+            trip_id_col=TRIP_ID_COL 
+        )
+
+        # 5. Segment Trips using the DataFrame's flag column
+        trips_seg_dict = split_rem_non_overlap_walk_forward_seg(
+            df_clean,
+            trip_id_col=TRIP_ID_COL,
+            stop_flag_col=STOP_FLAG_COL,
             min_win=MIN_SEGMENT_POINTS,
             full_stop=CONSECUTIVE_STOPS_FOR_BREAK,
             random_state=RANDOM_STATE
         )
 
-        # for cyc in cycles_seg_dict:
-        #     print(f"\ncycle: {cyc}")
-        #     print(cycles_seg_dict[cyc])
+        # 6. Evaluate the segmentation with the new comprehensive rules
+        evaluate_segmentation_rules(
+            df=df_clean,
+            trips_seg_dict=trips_seg_dict,
+            stop_flag_col=STOP_FLAG_COL,
+            trip_id_col=TRIP_ID_COL,
+            min_win=MIN_SEGMENT_POINTS,
+            full_stop=CONSECUTIVE_STOPS_FOR_BREAK,
+            max_print=1000
+        )
 
-        # 5. Save Segmentation Dictionary
+        # 7. Summarize results using the same rule-consistent logic
+        summarize_segmentation_results(
+            df=df_clean,
+            trips_seg_dict=trips_seg_dict,
+            trip_id_col=TRIP_ID_COL,
+            stop_flag_col=STOP_FLAG_COL,
+            full_stop=CONSECUTIVE_STOPS_FOR_BREAK
+        )
+        
+        # 8. Find the max segment using the same rule-consistent logic
+        find_and_print_trip_with_max_segment(
+            df=df_clean,
+            trips_seg_dict=trips_seg_dict,
+            trip_id_col=TRIP_ID_COL,
+            stop_flag_col=STOP_FLAG_COL,
+            full_stop=CONSECUTIVE_STOPS_FOR_BREAK
+        )
+
+        # 6. Save the final segmentation dictionary
         print(f"\n--- Saving Segmentation Dictionary ---")
         save_file(
-            data=cycles_seg_dict, path=SEGMENTATION_DICT_DIR,
+            data=trips_seg_dict, path=SEGMENTATION_DICT_DIR,
             file_name=SEGMENTATION_DICT_FILENAME, format=OUTPUT_FORMAT
         )
 
@@ -343,331 +741,4 @@ def main():
         traceback.print_exc()
 
 if __name__ == '__main__':
-    import traceback
     main()
-
-
-
-
-# def get_prediction_periods(cycles_natural_stops_dict, 
-#                            min_pre_samples=10, 
-#                            min_period_samples=10, 
-#                            full_stop=3,
-#                            stop_indicator = -1):
-#     """
-#     For each cycle, label consecutive 'prediction periods' 
-#     (1, 2, 3, ...) based on:
-    
-#       1) Only the first period in the cycle has a 'warmup' requirement
-#          of min_pre_samples rows.
-#       2) We do not start counting that warmup if the row is stop_indicator.
-#          Once we see a non-stop_indicator, we begin counting, including
-#          any subsequent stop_indicator rows.
-#       3) We cannot start a period on stop_indicator.
-#       4) We stop the period before any block of 'full_stop'
-#          consecutive stop_indicator rows.
-#       5) The period must have at least 'min_period_samples' rows.
-#     """
-#     cycles_natural_stops_dict_copy = cycles_natural_stops_dict.copy()
-
-#     for cyc, cyc_data in cycles_natural_stops_dict_copy.items():
-
-#         n_samples_cycle = len(cyc_data)
-        
-#         # Tracking for the current cycle
-#         curr_period = 1
-#         first_period = True  # only the first period in each cycle enforces warmup
-        
-#         # Warmup logic
-#         warmup_started = False
-#         counted_samples = 0
-        
-#         i = 0
-#         while i < n_samples_cycle:
-            
-#             # --------------- FIRST-PERIOD WARMUP LOGIC ---------------
-#             if first_period and not warmup_started:
-#                 # We have NOT started counting yet
-#                 if cyc_data[i] == stop_indicator:
-#                     # skip -1 rows until we see a non-stop_indicator to begin counting
-#                     i += 1
-#                     continue
-#                 else:
-#                     # Found our first non-stop_indicator row
-#                     warmup_started = True
-#                     counted_samples = 1
-#                     i += 1
-#                     continue
-            
-#             if first_period and warmup_started and counted_samples < min_pre_samples:
-#                 # Keep counting rows (including -1) until we reach min_pre_samples
-#                 counted_samples += 1
-#                 i += 1
-#                 continue
-            
-#             # --------------- READY TO START A PERIOD ---------------
-#             # If we are still in the first_period but the warmup is complete,
-#             # OR if we're past the first_period entirely, we can look for a start.
-            
-#             # Skip if the row is stop_indicator. We cannot start a period on stop_indicator.
-#             if cyc_data[i] == stop_indicator:
-#                 i += 1
-#                 continue
-            
-#             # Now we have a valid starting point for a period
-#             period_start = i
-            
-#             # Find the end by searching for 'full_stop' consecutive stop_indicator
-#             consecutive_stops = 0
-#             period_end = None
-#             j = i
-#             while j < n_samples_cycle:
-#                 if cyc_data[j] == stop_indicator:
-#                     consecutive_stops += 1
-#                 else:
-#                     consecutive_stops = 0
-
-#                 if consecutive_stops == full_stop:
-#                     # Period ends just before this block
-#                     period_end = j - full_stop
-#                     break
-#                 j += 1
-            
-#             # If we never hit a block of 'full_stop', period ends at the last index
-#             if period_end is None:
-#                 period_end = n_samples_cycle - 1
-            
-#             # Check if period has at least min_period_samples rows
-#             length = period_end - period_start + 1
-#             if length >= min_period_samples:
-#                 # Label this period
-#                 for k in range(period_start, period_end + 1):
-#                     if cyc_data[k] != stop_indicator:
-#                         cyc_data[k] = curr_period
-#                 curr_period += 1
-
-#             # Advance i to period_end + 1 to look for the next period
-#             i = period_end + 1
-            
-#             # We have handled the first_period, so no more warmup constraints
-#             first_period = False
-#             warmup_started = False  # not relevant any more, but can reset
-
-#         # Update the cycle data
-#         cycles_natural_stops_dict_copy[cyc] = cyc_data
-
-#     return cycles_natural_stops_dict_copy
-
-# def walk_forward_seg(cycles_prediction_periods_dict, min_win=10, max_win=15, stop_indicator=-1):
-
-#     cycles_prediction_periods_dict_copy = cycles_prediction_periods_dict.copy()
-    
-#     # Process each cycle independently
-#     for cyc, cyc_data in cycles_prediction_periods_dict_copy.items():
-#         n_samples_cycle = len(cyc_data)
-#         curr_per = 0  # Reset per cycle 
-#         start_idx = 0  # Start scanning from the beginning of the cycle
-        
-#         # Continue to segment until we reach the end of the cycle
-#         while start_idx < n_samples_cycle:
-#             # Find the first valid index that is neither stop_indicator nor curr_per
-#             win_start = next((i for i in range(start_idx, n_samples_cycle)
-#                               if cyc_data[i] not in [stop_indicator, curr_per]), None)
-#             if win_start is None:
-#                 break  # No valid start found in the remaining cycle
-            
-#             # Find an index indicating where the current segment might end
-#             per_end = next((i for i in range(win_start, n_samples_cycle)
-#                             if cyc_data[i] not in [stop_indicator, curr_per, curr_per + 1]), None)
-#             if per_end is None:
-#                 per_end = n_samples_cycle - 1
-            
-#             per_length = per_end - win_start
-#             if per_length >= min_win:
-#                 # Choose a random end within the allowed window range
-#                 win_end = random.randint(win_start + min_win, min(per_end, win_start + max_win))
-                
-#                 # Label this segment
-#                 for k in range(win_start, win_end + 1):
-#                     if cyc_data[k] != stop_indicator:
-#                         cyc_data[k] = curr_per + 1
-                        
-#                 # Update current period and advance start_idx to avoid overlapping with already labeled segment
-#                 curr_per += 1
-#                 start_idx = win_end + 1
-#             else:
-#                 # If not enough data for a segment, break
-#                 break
-            
-#     return cycles_prediction_periods_dict_copy
-
-
-# def fixed_non_overlap_walk_forward_seg(cycles_natural_stops_dict, win_size=10, stop_indicator=-1, full_stop=3):
-    
-#     # Make a shallow copy to avoid mutating original
-#     cycles_natural_stops_dict_copy = cycles_natural_stops_dict.copy()
-    
-#     # Process each cycle independently
-#     for cyc, cyc_data in cycles_natural_stops_dict_copy.items():
-        
-#         n_samples_cycle = len(cyc_data)
-
-#         curr_per = 1
-
-#         valid_prev = False
-
-#         i = 0
-#         while i < n_samples_cycle:
-
-#             # Skip stop_indicator rows
-#             if cyc_data[i] == stop_indicator:
-#                 i += 1
-#                 continue
-            
-#             # Attempt to define one segment of length win_size
-#             win_start = i
-
-#             consec_stops = 0
-#             j = win_start
-#             win_non_stops = 0
-
-#             # Check for a block of full_stop consecutive stops
-#             while j < n_samples_cycle:
-#                 if cyc_data[j] == stop_indicator:
-#                     consec_stops += 1
-#                 else:
-#                     consec_stops = 0
-#                     win_non_stops += 1
-
-#                 if consec_stops == full_stop:
-#                     # We found a block of stops => do partial labeling or skip
-#                     if valid_prev:
-#                         # Label partial
-#                         for h in range(win_start, j - full_stop + 1):
-#                             if cyc_data[h] != stop_indicator:
-#                                 cyc_data[h] = curr_per - 1
-                    
-#                     i = j + 1
-#                     valid_prev = False
-#                     break
-                
-#                 if win_non_stops == win_size:
-#                     for k in range(win_start, j + 1):
-#                         if cyc_data[k] != stop_indicator:
-#                             cyc_data[k] = curr_per
-
-#                     curr_per += 1
-#                     i = j + 1
-#                     valid_prev = True
-#                     break
-                
-#                 j += 1
-
-#             if win_non_stops <  win_size:
-#                 # Label partial remainder if not in first segment
-#                 if valid_prev:
-#                     for d in range(win_start, n_samples_cycle):
-#                         if cyc_data[d] != stop_indicator:
-#                             cyc_data[d] = curr_per - 1
-#                 break # End of cycle
-        
-#         cycles_natural_stops_dict_copy[cyc] = cyc_data
-
-#     return cycles_natural_stops_dict_copy
-
-
-# def split_rem_non_overlap_walk_forward_seg(cycles_natural_stops_dict, min_win=10, stop_indicator=-1, full_stop=3):
-    
-#     # Make a shallow copy to avoid mutating original
-#     cycles_natural_stops_dict_copy = cycles_natural_stops_dict.copy()
-    
-#     # Process each cycle independently
-#     for cyc, cyc_data in cycles_natural_stops_dict_copy.items():
-        
-#         n_samples_cycle = len(cyc_data)
-
-#         curr_per = 1
-
-#         i = 0
-#         while i < n_samples_cycle:
-
-#             # Skip stop_indicator rows
-#             if cyc_data[i] == stop_indicator:
-#                 i += 1
-#                 continue
-            
-#             win_start = i
-
-#             consec_stops = 0
-#             j = win_start
-#             valid_samples = 0
-
-#             while j < n_samples_cycle:
-#                 if cyc_data[j] == stop_indicator:
-#                     consec_stops += 1
-#                 else:
-#                     consec_stops = 0
-#                     valid_samples += 1
-
-#                 if consec_stops == full_stop:
-
-#                     break
-
-#                 j += 1
-            
-#             n_seg = valid_samples // min_win
-
-#             if n_seg > 0:
-#                 to_split = valid_samples % min_win 
-
-#                 # Partition to_split into n_seg parts, ensuring the sum equals to_split.
-#                 partition = random_partition(to_split, n_seg)
-
-#                 for addition in partition:
-#                     labeled = 0
-#                     k = win_start
-#                     while labeled < min_win + addition and k < n_samples_cycle:
-#                         if cyc_data[k] != stop_indicator:
-#                             cyc_data[k] = curr_per
-#                             labeled += 1
-#                         k += 1
-#                     win_start = k
-#                     curr_per += 1
-                    
-#             i = j + 1
-                   
-#         cycles_natural_stops_dict_copy[cyc] = cyc_data
-
-#     return cycles_natural_stops_dict_copy
-
-#     df = load_file(file_path)
-#     print(f"Loaded data with {df.shape[0]} rows and {df.shape[1]} columns.")
-
-#     # sorting the df by cycle and time
-#     df = sort_df_by_cycle_time(df)
-
-#     #df = drop_short_long_trips(df, min_dur=0, min_dis=0, max_dur=1_000, max_dis=1_000)
-
-#     cycles_natural_stops_dict = find_natural_stops(df, thr_speed=1.5, thr_dis=0.1)
-
-#     # print(f"num of cycles: {len(cycles_natural_stops_dict)}")
-#     # count = sum(1 for arr in cycles_natural_stops_dict.values() if np.any(arr == -1))
-#     # print("Number of cycles with at least one stop:", count)
-#     # num_cycles = count_cycles_with_x_consecutive_stops(cycles_natural_stops_dict, 3)
-#     # print("Number of cycles containing", 3, "consecutive stops:", num_cycles)
-
-#     cycles_seg_dict = split_rem_non_overlap_walk_forward_seg(
-#                             cycles_natural_stops_dict, min_win=10, stop_indicator=-1, full_stop=3)
-    
-#     # for cyc in cycles_seg_dict:
-#     #     print(f"\ncycle: {cyc}")
-#     #     print(cycles_seg_dict[cyc])
-
-#     # saving segmentation dict as pickle
-#     dict_output_directory = r"C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\segmentation_dict"
-#     dict_filename = 'cycles_seg_dict'
-#     save_as_pickle(cycles_seg_dict, dict_output_directory, dict_filename) 
-
-
-# if __name__ == '__main__':
-#     main()

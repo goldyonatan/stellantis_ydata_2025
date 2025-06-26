@@ -10,6 +10,8 @@ from shapely.geometry import Point as ShapelyPoint
 import h3
 import traceback 
 from datetime import datetime, timedelta # For time handling # For meteostat time range
+from itertools import chain, combinations # Used for flattening lists efficiently
+from pathlib import Path
 # --- Import Meteostat ---
 try:
     from meteostat import Stations, Point, Hourly
@@ -27,7 +29,29 @@ warnings.filterwarnings("ignore", message="The behavior of DatetimeProperties.to
 # --- Import necessary functions from HelperFuncs ---
 try:
     # Add safe_mean to the import list
-    from HelperFuncs import load_file, haversine_distance, safe_mean,h3_to_latlon, save_file
+    from HelperFuncs import (
+        load_file, haversine_distance, safe_mean, h3_to_latlon, save_file, get_gadm_countries_geometry,
+        find_points_outside_target_area, plot_trip_speed_profiles, count_outliers_in_array, get_array_length,
+        ratio_rule,                       # Symmetric‐ratio comparisons 
+        simple_threshold_rule,            # Single‐column thresholds 
+        grade_rule,                       # Grade/altitude vs. distance checks
+        time_gap_rule,                    # Timestamp gap checks 
+        charging_while_moving_rule,       # Charging‐while‐moving physics rule
+        energy_per_100km_rule,            # Energy‐per‐100 km consumption rule 
+        uphill_no_energy_rule,            # Uphill‐no‐discharge rule 
+        descent_no_speed_change_rule,     # Descent‐no‐speed‐change rule
+        speed_spike_while_stationary_rule,# Internal‐speed‐spike when stationary 
+        odo_jump_short_time_rule,         # Odometer jump in short time 
+        teleport_with_no_energy_change_rule,  # GPS jump without SoC change
+        unrealistic_regen_on_descent_rule,    # Implausible regen on descent 
+        analyze_feature_misalignment,    # Main misalignment engine 
+        build_report,                    # Build flagged‐rows report 
+        print_misalignment_report,       # Pretty‐print the report 
+        MisalignmentConfig,              # Config dataclass 
+        Rule,                             # Rule dataclass :contentReference[oaicite:16]{index=16}
+        speed_spike_rule, # Excessive acceleration within 1-sec samples
+        alt_spike_across_rows_rule # Large altitude jump between rows
+) 
 except ImportError:
     print("Error: Could not import from HelperFuncs. Ensure HelperFuncs.py is accessible.")
     # Define placeholders if needed for testing, but ideally fix the import
@@ -36,35 +60,51 @@ except ImportError:
     def haversine_distance(lat1, lon1, lat2, lon2): raise NotImplementedError("HelperFuncs not found")
     def safe_mean(val): raise NotImplementedError("HelperFuncs not found")
     def h3_to_latlon(h3_index): raise NotImplementedError("HelperFuncs not found")
+    def get_gadm_countries_geometry(h3_index): raise NotImplementedError("HelperFuncs not found")
+    def find_points_outside_target_area(h3_index): raise NotImplementedError("HelperFuncs not found")
 
 # --- Configuration Block (Moved outside main for better visibility) ---
 INPUT_FILE_PATH = r'C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\df_sample\df_sample.parquet'
 OUTPUT_FILE_PATH = r'C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\clean_df\clean_df.parquet'
-# *** Path to your land shapefile ***
-#LAND_SHAPEFILE_PATH = r"C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\ne_10m_land\ne_10m_land.shp"
+# --- DEFINE THE PLOT OUTPUT DIRECTORY ---
+SPEED_OUTLIERS_PLOT_DIR = r"C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\speed_outliers_plots"
+GADM_FOLDER_PATH = r"C:\Users\goldy\OneDrive\Documents\Y-DATA 24-25\Stellantis Project\End-to-End\gadm41"
 
 # --- Preprocessing Thresholds ---
-MIN_TRIP_KM = 0.5 # Increased slightly from 0 to avoid noise trips
-MAX_TRIP_KM = 500.0 # max length
-MAX_GPS_JUMP_KM = 5.0 # Max distance between consecutive GPS points
-MAX_CONSECUTIVE_SPEED_DIFF = 100 # Max diff between mean speed of consecutive records (kph)
-MAX_CONSECUTIVE_ALT_DIFF = 500 # Max altitude diff between consecutive records (meters)
-MAX_CONSECUTIVE_SOC_DIFF = 10 # Max SoC % diff between consecutive records
-MAX_CONSECUTIVE_TEMP_DIFF = 5 # Max Temp C diff between consecutive records
-MAX_CONSECUTIVE_TIME_GAP_SECONDS = 110 # Max seconds between consecutive records (110 sec)
+EXPECTED_SPEED_ARRAY_SAMPLES = 60
+EXPECTED_ALT_ARRAY_SAMPLES = 10
+
+MIN_VALID_SPEED = 0
+MAX_VALID_SPEED = 250
 MIN_VALID_SOC = 0
 MAX_VALID_SOC = 100
-MIN_VALID_TEMP = -20
-MAX_VALID_TEMP = 50
-MIN_VALID_ALTITUDE = -500 # Allow slightly below sea level
-MAX_VALID_ALTITUDE = 10000 # Reasonable max altitude
+MIN_VALID_TEMP = -15
+MAX_VALID_TEMP = 46
+MIN_VALID_ALTITUDE = -300 # Allow slightly below sea level
+MAX_VALID_ALTITUDE = 3375 # Reasonable max altitude
 MIN_VALID_BATT_HEALTH = 50 # SOH %
-MAX_VALID_BATT_HEALTH = 130 # SOH %
-MAX_VALID_ODO = 1000000 # Max odometer reading (km)
-MAX_VALID_WEIGHT = 5000 # Max empty weight (kg)
-MIN_VALID_WEIGHT = 500 # Min empty weight (kg)
-SPEED_DIST_TOLERANCE_FACTOR = 3.5 # Allow distance covered to be X times speed*time (for accel/decel)
-SOC_INCREASE_THRESHOLD = 0.5 # Allow small SoC increases (regen, noise)
+MAX_VALID_BATT_HEALTH = 100 # SOH %
+MAX_VALID_ODO = 1_000_000 # Max odometer reading (km)
+MAX_VALID_WEIGHT = 4000 # Max empty weight (kg)
+MIN_VALID_WEIGHT = 950 # Min empty weight (kg)
+
+MAX_TIME_GAP_SECONDS = 61 
+MIN_TIME_GAP_SECONDS = 59 
+POS_MAX_SPEED_DIFF = 25 
+NEG_MAX_SPEED_DIFF = 30
+POS_MAX_ALT_DIFF = 9.5 # in 10 sec
+NEG_MAX_ALT_DIFF = 10 # in 10 sec
+MAX_LOCATION_DIFF = 0.08 # in km
+POS_MAX_ODO_DIFF = 2.5 # in km
+NEG_MAX_ODO_DIFF = 0.0001 # in km
+NEG_MAX_SOC_DIFF = 3.55
+POS_MAX_SOC_DIFF = 1.15
+POS_MAX_TEMP_DIFF = 3.1
+NEG_MAX_TEMP_DIFF = 3.6
+NEG_MAX_SOH_DIFF = 0.1 
+
+# MIN_TRIP_KM = 0.5 # Increased slightly from 0 to avoid noise trips
+# MAX_TRIP_KM = 450.0 # max length
 
 FILTER_ZERO_COORDINATES = True # Filter individual (0,0) points?
 FILTER_MOSTLY_ZERO_TRIPS = True # Filter trips with >75% (0,0) points?
@@ -74,6 +114,7 @@ ZERO_TRIP_THRESHOLD = 0.75 # Threshold for filtering trips
 MAX_TEMP_DIFFERENCE_C = 5 # Max allowed diff between vehicle temp and weather temp
 FETCH_WEATHER_DATA = False # Set to False to skip weather fetching/comparison
 PROCESS_SUBSET = None # Set to an integer (e.g., 5000) to process only the first N rows for testing
+VALIDATE_POINTS_IN_AREA = False # Set to False to skip points in area validation 
 
 # --- Column Rename Mapping ---
 COLUMN_RENAME_MAP = {
@@ -81,11 +122,11 @@ COLUMN_RENAME_MAP = {
     'TYPE_OF_TRACTION_CHAIN': 'traction_type','EMPTY_WEIGHT_KG': 'empty_weight_kg',
     'DESTINATION_COUNTRY_CODE': 'destination_country_code','BATTERY_TYPE': 'battery_type',
     'LEV_BATT_CAPC_HEAL': 'battery_health','CYCLE_ID': 'trip_id',
-    'MESS_ID_START': 'message_session_id','DATETIME_START': 'cycle_datetime_start',
-    'DATETIME_END': 'cycle_datetime_end','dt': 'cycle_date',
-    'SOC_START': 'cycle_soc_start','SOC_END': 'cycle_soc_end',
-    'ODO_START': 'cycle_odo_start','ODO_END': 'cycle_odo_end',
-    'geoindex_10_start': 'cycle_location_start','geoindex_10_end': 'cycle_location_end',
+    'MESS_ID_START': 'message_session_id','DATETIME_START': 'trip_datetime_start',
+    'DATETIME_END': 'trip_datetime_end','dt': 'trip_date',
+    'SOC_START': 'trip_soc_start','SOC_END': 'trip_soc_end',
+    'ODO_START': 'trip_odo_start','ODO_END': 'trip_odo_end',
+    'geoindex_10_start': 'trip_location_start','geoindex_10_end': 'trip_location_end',
     'HEAD_COLL_TIMS': 'timestamp','PERD_VEHC_LIFT_MILG': 'current_odo',
     'LEV_BATT_LOAD_LEVL': 'current_soc','geoindex_10': 'current_location',# This is the H3 index column
     'latitude': 'latitude', # Include even if not present in input, will be created
@@ -108,20 +149,21 @@ VEHICLE_TEMP_COL = 'outside_temp' # Standard name for vehicle temp
 BATT_HEALTH_COL = 'battery_health'
 WEIGHT_COL = 'empty_weight_kg'
 MSG_SESSION_ID_COL = 'message_session_id'
+CAR_MODEL_COL = "car_model"
+MANUFACTURER_COL = "manufacturer"
+BATTERY_TYPE_COL = "battery_type"
 
 # Columns expected constant per trip
 STATIC_TRIP_COLS = [
     'car_model', 'manufacturer', 'traction_type', 'empty_weight_kg',
     'destination_country_code', 'battery_type',
-    'message_session_id', 'cycle_datetime_start', 'cycle_datetime_end',
-    'cycle_date', 'cycle_soc_start', 'cycle_soc_end', 'cycle_odo_start',
-    'cycle_odo_end', 'cycle_location_start', 'cycle_location_end'
+    'message_session_id', 'trip_datetime_start', 'trip_datetime_end',
+    'trip_date', 'trip_soc_start', 'trip_soc_end', 'trip_odo_start',
+    'trip_odo_end', 'trip_location_start', 'trip_location_end'
 ]
 # Columns for duplicate row check
 DUPLICATE_CHECK_COLS_STD = [TRIP_ID_COL, TIME_COL]
 # -------------------------
-
-# --- Individual Preprocessing Functions (Updated) ---
 
 def filter_inconsistent_trip_data(df, trip_id_col, cols_to_check):
     """Filters out trips where static columns have multiple unique values."""
@@ -535,119 +577,16 @@ def flag_suspicious_temperatures(df, vehicle_temp_col='outside_temp', weather_te
     print(f"Result shape (with flag added): {df.shape}")
     return df
 
-def filter_gps_at_sea(df, land_geom, lat_col='latitude', lon_col='longitude', max_sea_locations_to_print=20):
+def filter_unrealistic_ranges(df, range_checks, trip_id_col='trip_id', max_details_to_print=10, plot_output_dir=None):
     """
-    Filters out rows where GPS coordinates fall outside the provided land geometry.
-    Reports counts of unique locations identified as being at sea.
-
-    Args:
-        df (pd.DataFrame): Input DataFrame with latitude and longitude columns.
-        land_geom (shapely.geometry.base.BaseGeometry): Unified Shapely geometry for land.
-        lat_col (str): Name of the latitude column.
-        lon_col (str): Name of the longitude column.
-        max_sea_locations_to_print (int): Max number of unique sea locations to print details for.
-
-
-    Returns:
-        pd.DataFrame: DataFrame with rows outside the land geometry removed.
+    Filters or corrects rows with out-of-range values.
+    - For 'battery_health', it corrects values and provides a detailed summary of the outcome.
+    - For 'speed_array', it identifies and returns the trip IDs with violations without dropping rows.
+    - For all other columns, it provides detailed reporting and then drops the out-of-range rows.
     """
-    print("\n--- Filtering GPS Points At Sea ---")
-    required_cols = [lat_col, lon_col]
-    if not all(col in df.columns for col in required_cols):
-        print(f"Warning: Missing required columns ({required_cols}). Skipping filter.")
-        return df
-    if land_geom is None:
-        print("Warning: Land geometry not provided. Skipping filter.")
-        return df
-
-    initial_rows = len(df)
-    df[lat_col] = pd.to_numeric(df[lat_col], errors='coerce')
-    df[lon_col] = pd.to_numeric(df[lon_col], errors='coerce')
-    df_to_check = df.dropna(subset=[lat_col, lon_col]).copy()
-    rows_dropped_nan = initial_rows - len(df_to_check)
-    if rows_dropped_nan > 0:
-        print(f" - Temporarily ignoring {rows_dropped_nan} rows with invalid/missing GPS coordinates for this check.")
-
-    if df_to_check.empty:
-        print(" - No valid GPS coordinates remaining to check.")
-        print(f"Result shape: {df.shape}")
-        return df
-
-    try:
-        geometry = gpd.points_from_xy(df_to_check[lon_col], df_to_check[lat_col])
-        gdf = gpd.GeoDataFrame(df_to_check, geometry=geometry, crs="EPSG:4326")
-
-        print(f" - Performing spatial check against land geometry...")
-        is_on_land_mask = gdf.within(land_geom)
-        print(f" - Spatial check complete.")
-
-        # --- Identify points AT SEA ---
-        at_sea_mask = ~is_on_land_mask
-        at_sea_indices = gdf.index[at_sea_mask]
-        num_at_sea = len(at_sea_indices)
-
-        if num_at_sea > 0:
-            print(f" - Found {num_at_sea} points determined to be at sea.")
-
-            # --- Count unique locations at sea ---
-            at_sea_coords = df_to_check.loc[at_sea_indices, [lat_col, lon_col]]
-            # Round coordinates slightly to group nearby error points if desired
-            # e.g., at_sea_coords = at_sea_coords.round(4)
-            unique_sea_locations = at_sea_coords.value_counts().reset_index(name='count')
-            num_unique_sea_locations = len(unique_sea_locations)
-            print(f" - These points correspond to {num_unique_sea_locations} unique lat/lon locations.")
-
-            # Print details of the most common sea locations
-            print(f"   Most common locations identified as 'at sea' (up to {max_sea_locations_to_print}):")
-            # Sort by count descending
-            unique_sea_locations = unique_sea_locations.sort_values('count', ascending=False)
-            for i, row in enumerate(unique_sea_locations.head(max_sea_locations_to_print).itertuples()):
-                 print(f"     Lat: {row.latitude:<12.6f} Lon: {row.longitude:<12.6f} Count: {row.count}")
-            if num_unique_sea_locations > max_sea_locations_to_print:
-                 print(f"     ... ({num_unique_sea_locations - max_sea_locations_to_print} more unique locations omitted)")
-            # ------------------------------------
-
-        else:
-             print(" - No points determined to be at sea.")
-
-
-        # --- Filter the DataFrame ---
-        # Keep rows that are ON LAND or had initial NaN coordinates
-        land_indices = gdf.index[is_on_land_mask]
-        original_indices_to_keep = df.index[df[lat_col].isna() | df[lon_col].isna()]
-        final_indices_to_keep = land_indices.union(original_indices_to_keep)
-        df_filtered = df.loc[final_indices_to_keep].copy()
-        rows_dropped_total = initial_rows - len(df_filtered)
-
-        print(f"\nResult shape after filtering points at sea: {df_filtered.shape} (Removed {rows_dropped_total} rows total)")
-        return df_filtered
-
-    except ImportError:
-        print("Warning: GeoPandas or Shapely not installed. Skipping GPS land check.")
-        return df
-    except Exception as e:
-        print(f"Warning: Error during GPS land check: {e}. Skipping filter.")
-        traceback.print_exc()
-        return df
-
-def filter_unrealistic_ranges(df, range_checks, max_values_to_print=10):
-    """
-    Filters rows where values fall outside specified min/max ranges.
-    Prints details about the out-of-range values found.
-
-    Args:
-        df (pd.DataFrame): The input DataFrame.
-        range_checks (dict): Dictionary mapping column names to (min_val, max_val) tuples.
-        max_values_to_print (int): Max number of out-of-range values to print per column.
-
-    Returns:
-        pd.DataFrame: DataFrame with rows containing out-of-range values removed.
-    """
-    print("\n--- Filtering Unrealistic Sensor Ranges ---")
-    df_filtered = df.copy() # Work on a copy to avoid modifying original during checks
-    initial_rows = len(df_filtered)
-    total_rows_dropped = 0
-    temp_cols_created = [] # Keep track of temporary columns
+    print("\n--- Filtering/Correcting Unrealistic Sensor Ranges ---")
+    df_filtered = df.copy()
+    speed_violation_trip_ids = set()  # Use a set to store unique trip IDs
 
     for col, (min_val, max_val) in range_checks.items():
         if col not in df_filtered.columns:
@@ -655,312 +594,804 @@ def filter_unrealistic_ranges(df, range_checks, max_values_to_print=10):
             continue
 
         print(f"\n - Checking range for '{col}' ({min_val} to {max_val}).")
-        col_to_check = col # Default to original column
-        is_array_like = df_filtered[col].iloc[0:min(100, len(df_filtered))].apply(lambda x: isinstance(x, (list, np.ndarray))).any()
+        
+        sample = df_filtered[col].dropna().head(100)
+        is_array_like = sample.apply(lambda x: isinstance(x, (list, np.ndarray))).any()
 
-        # --- Prepare column for checking (handle arrays, ensure numeric) ---
+        out_of_range_mask = pd.Series(False, index=df_filtered.index)
         if is_array_like:
-            print(f"   (Applying range check to mean of array column '{col}')")
-            temp_mean_col = f"{col}_mean_temp_range_check"
-            temp_cols_created.append(temp_mean_col)
-            df_filtered[temp_mean_col] = df_filtered[col].apply(safe_mean)
-            col_to_check = temp_mean_col
+            print(f"   (Applying range check to each raw value in array column '{col}')")
+            def is_any_value_out_of_range(arr):
+                if not isinstance(arr, (list, np.ndarray)): return False
+                return any(isinstance(v, (int, float)) and not (min_val <= v <= max_val) for v in arr)
+            out_of_range_mask = df_filtered[col].apply(is_any_value_out_of_range)
         else:
-            # Ensure scalar column is numeric, store original before coercion for potential printing
-            original_values = df_filtered[col].copy()
-            df_filtered[col_to_check] = pd.to_numeric(df_filtered[col], errors='coerce')
+            numeric_col = pd.to_numeric(df_filtered[col], errors='coerce')
+            out_of_range_mask = numeric_col.notna() & ((numeric_col < min_val) | (numeric_col > max_val))
 
-        if col_to_check not in df_filtered.columns:
-             print(f"   Warning: Could not perform range check for '{col}' (column or mean calculation failed).")
-             continue
+        num_out_of_range_rows = out_of_range_mask.sum()
 
-        # --- Identify and Print Out-of-Range Values ---
-        # Condition: Value is NOT NaN AND (Value < min_val OR Value > max_val)
-        out_of_range_mask = (
-            df_filtered[col_to_check].notna() &
-            ((df_filtered[col_to_check] < min_val) | (df_filtered[col_to_check] > max_val))
-        )
-        num_out_of_range = out_of_range_mask.sum()
-
-        if num_out_of_range > 0:
-            print(f"   Found {num_out_of_range} out-of-range values for '{col}'.")
-            # Get the actual out-of-range values (from the column used for checking)
-            out_of_range_values = df_filtered.loc[out_of_range_mask, col_to_check]
-
-            # If checking mean of array, maybe show original array too? More complex.
-            # For now, just show the value that failed the check (mean or scalar)
-            values_to_print = out_of_range_values.unique() # Show unique bad values found
-            print(f"     Unique out-of-range values found (up to {max_values_to_print}): ", end="")
-            print(f"{values_to_print[:max_values_to_print].tolist()}" + ("..." if len(values_to_print) > max_values_to_print else ""))
-
-            # --- Filter the DataFrame ---
-            # Keep rows where value is within range OR is NaN
-            df_filtered = df_filtered[~out_of_range_mask]
-            print(f"   Dropped {num_out_of_range} rows.")
-            total_rows_dropped += num_out_of_range
-        else:
+        if num_out_of_range_rows == 0:
             print(f"   No out-of-range values found for '{col}'.")
+            continue
 
-    # --- Clean up temporary columns ---
-    df_filtered = df_filtered.drop(columns=temp_cols_created, errors='ignore')
+        print(f"   Found {num_out_of_range_rows} rows with out-of-range values for '{col}'.")
+        
+        affected_trips_df = df_filtered.loc[out_of_range_mask, [trip_id_col]]
+        affected_trip_ids = affected_trips_df[trip_id_col].unique()
+        num_unique_trips = len(affected_trip_ids)
+        print(f"     These rows belong to {num_unique_trips} unique trip(s).")
 
-    print(f"\nResult shape after range checks: {df_filtered.shape} (Removed {total_rows_dropped} rows total)")
-    return df_filtered
+        # --- SPECIAL HANDLING FOR BATTERY_HEALTH ---
+        if col == BATT_HEALTH_COL:
+            print("     Detailed analysis (correcting values in-place):")
+            
+            trips_corrected_count = 0
+            trips_all_nan_count = 0
+            
+            trip_groups = df_filtered.groupby(trip_id_col, observed=True)
+            
+            # --- CORRECTED LOOP STRUCTURE ---
+            for i, trip_id in enumerate(affected_trip_ids):
+                
+                # --- Reporting Logic (Limited by max_details_to_print) ---
+                if i < max_details_to_print:
+                    trip_group = trip_groups.get_group(trip_id)
+                    oor_mask_for_trip_reporting = out_of_range_mask.loc[trip_group.index]
+                    
+                    num_oor_rows_in_trip = oor_mask_for_trip_reporting.sum()
+                    total_rows_in_trip = len(trip_group)
+                    pct_oor_rows = (num_oor_rows_in_trip / total_rows_in_trip) * 100
+                    oor_values_in_trip = trip_group.loc[oor_mask_for_trip_reporting, col].unique().tolist()
+                    print(f"     - Trip ID: {trip_id} | OOR Rows: {num_oor_rows_in_trip}/{total_rows_in_trip} ({pct_oor_rows:.1f}%) | Value(s): {', '.join(map(str, oor_values_in_trip))}")
+                    
+                    if pct_oor_rows < 100.0:
+                        first_violation_iloc = np.where(oor_mask_for_trip_reporting)[0][0]
+                        context_window = 5
+                        start_iloc = max(0, first_violation_iloc - context_window)
+                        end_iloc = min(len(trip_group), first_violation_iloc + 1 + context_window)
+                        context_cols = ['timestamp', col] if 'timestamp' in trip_group.columns else [col]
+                        context_df = trip_group.iloc[start_iloc:end_iloc][context_cols].copy()
+                        context_df['marker'] = ''
+                        violation_original_index = trip_group.index[first_violation_iloc]
+                        context_df.loc[violation_original_index, 'marker'] = '<-- OOR'
+                        if start_iloc == 0:
+                            trip_start_index = trip_group.index[0]
+                            if context_df.loc[trip_start_index, 'marker'] == '':
+                                context_df.loc[trip_start_index, 'marker'] = '<-- TRIP START'
+                            else:
+                                context_df.loc[trip_start_index, 'marker'] += ' (TRIP START)'
+                        print("       Context for first OOR value:\n" + "\n".join([f"       {line}" for line in context_df.to_string().split('\n')]))
+                
+                elif i == max_details_to_print:
+                    print(f"     ... (details for remaining {num_unique_trips - i} trips omitted)")
 
-# --- NEW: Negative Value Filtering Function ---
-def filter_negative_values_extended(df, cols_to_check):
+                # --- Correction Logic (RUNS FOR EVERY AFFECTED TRIP) ---
+                trip_mask = df_filtered[trip_id_col] == trip_id
+                oor_mask_for_correction = out_of_range_mask.loc[trip_mask]
+                
+                df_filtered.loc[trip_mask & oor_mask_for_correction, col] = np.nan
+                trip_series = df_filtered.loc[trip_mask, col]
+                
+                if trip_series.dropna().empty:
+                    trips_all_nan_count += 1
+                else:
+                    trips_corrected_count += 1
+                    df_filtered.loc[trip_mask, col] = trip_series.bfill().ffill()
+
+            # --- DETAILED SUMMARY (Now accurate) ---
+            print(f"\n   Correction Summary for '{col}':")
+            rows_still_nan = df_filtered.loc[out_of_range_mask, col].isnull().sum()
+            rows_successfully_filled = num_out_of_range_rows - rows_still_nan
+            
+            print(f"   - Trips successfully corrected: {trips_corrected_count} (had at least one valid value to fill from)")
+            print(f"   - Trips now with all NaN values: {trips_all_nan_count} (had no valid values)")
+            print(f"   - Total rows successfully filled: {rows_successfully_filled}")
+            print(f"   - Total rows that remain NaN: {rows_still_nan}")
+
+        # --- NEW HANDLING FOR SPEED_ARRAY ---
+        elif col == SPEED_ARRAY_COL:
+            print("     Detailed analysis (reporting violations, not dropping rows):")
+            speed_violation_trip_ids.update(affected_trip_ids)  # Collect the trip IDs
+            
+            trip_groups = df_filtered.groupby(trip_id_col, observed=True)
+            for i, trip_id in enumerate(affected_trip_ids):
+                if i >= max_details_to_print:
+                    print(f"     ... (details for remaining {num_unique_trips - i} trips omitted)")
+                    break
+                
+                trip_group = trip_groups.get_group(trip_id)
+                oor_mask_for_trip = out_of_range_mask.loc[trip_group.index]
+                
+                num_oor_rows_in_trip = oor_mask_for_trip.sum()
+                total_rows_in_trip = len(trip_group)
+                pct_oor_rows = (num_oor_rows_in_trip / total_rows_in_trip) * 100
+                
+                oor_indices = np.where(oor_mask_for_trip)[0]
+                num_blocks = np.sum(np.diff(oor_indices) > 1) + 1 if len(oor_indices) > 0 else 0
+                
+                total_samples_in_trip = trip_group[col].dropna().apply(len).sum()
+                def count_outliers(arr):
+                    if not isinstance(arr, (list, np.ndarray)): return 0
+                    return sum(1 for v in arr if isinstance(v, (int, float)) and not (min_val <= v <= max_val))
+                num_oor_samples_in_trip = trip_group.loc[oor_mask_for_trip, col].apply(count_outliers).sum()
+                pct_oor_samples = (num_oor_samples_in_trip / total_samples_in_trip) * 100 if total_samples_in_trip > 0 else 0
+                print(f"     - Trip ID: {trip_id} | "
+                      f"Rows: {num_oor_rows_in_trip}/{total_rows_in_trip} ({pct_oor_rows:.1f}%) | "
+                      f"Samples: {num_oor_samples_in_trip}/{total_samples_in_trip} ({pct_oor_samples:.1f}%) | "
+                      f"Blocks: {num_blocks}")
+            print(f"\n   Identified {len(affected_trip_ids)} trips with speed violations. Rows will NOT be dropped here.")
+
+        # --- DEFAULT HANDLING FOR ALL OTHER COLUMNS ---
+        else:
+            print("     Detailed analysis (dropping these rows):")
+            trip_groups = df_filtered.groupby(trip_id_col, observed=True)
+
+            for i, trip_id in enumerate(affected_trip_ids):
+                if i >= max_details_to_print:
+                    print(f"     ... (details for remaining {num_unique_trips - i} trips omitted)")
+                    break
+                
+                trip_group = trip_groups.get_group(trip_id)
+                oor_mask_for_trip = out_of_range_mask.loc[trip_group.index]
+                
+                num_oor_rows_in_trip = oor_mask_for_trip.sum()
+                total_rows_in_trip = len(trip_group)
+                pct_oor_rows = (num_oor_rows_in_trip / total_rows_in_trip) * 100
+                
+                oor_indices = np.where(oor_mask_for_trip)[0]
+                num_blocks = np.sum(np.diff(oor_indices) > 1) + 1 if len(oor_indices) > 0 else 0
+                
+                if is_array_like:
+                    total_samples_in_trip = trip_group[col].dropna().apply(len).sum()
+                    def count_outliers(arr):
+                        if not isinstance(arr, (list, np.ndarray)): return 0
+                        return sum(1 for v in arr if isinstance(v, (int, float)) and not (min_val <= v <= max_val))
+                    num_oor_samples_in_trip = trip_group.loc[oor_mask_for_trip, col].apply(count_outliers).sum()
+                    pct_oor_samples = (num_oor_samples_in_trip / total_samples_in_trip) * 100 if total_samples_in_trip > 0 else 0
+                    print(f"     - Trip ID: {trip_id} | "
+                          f"Rows: {num_oor_rows_in_trip}/{total_rows_in_trip} ({pct_oor_rows:.1f}%) | "
+                          f"Samples: {num_oor_samples_in_trip}/{total_samples_in_trip} ({pct_oor_samples:.1f}%) | "
+                          f"Blocks: {num_blocks}")
+                else:
+                    oor_values_in_trip = trip_group.loc[oor_mask_for_trip, col].unique().tolist()
+                    oor_values_str = ", ".join(map(str, oor_values_in_trip))
+                    print(f"     - Trip ID: {trip_id} | "
+                          f"OOR Rows: {num_oor_rows_in_trip}/{total_rows_in_trip} ({pct_oor_rows:.1f}%) | "
+                          f"Value(s): {oor_values_str} | "
+                          f"Blocks: {num_blocks}")
+
+                    if pct_oor_rows < 100.0:
+                        first_violation_iloc = oor_indices[0]
+                        context_window = 5
+                        start_iloc = max(0, first_violation_iloc - context_window)
+                        end_iloc = min(len(trip_group), first_violation_iloc + 1 + context_window)
+                        
+                        context_cols = [col]
+                        if 'timestamp' in trip_group.columns:
+                            context_cols.insert(0, 'timestamp')
+
+                        context_df = trip_group.iloc[start_iloc:end_iloc][context_cols].copy()
+                        context_df['marker'] = ''
+                        
+                        violation_original_index = trip_group.index[first_violation_iloc]
+                        context_df.loc[violation_original_index, 'marker'] = '<-- OOR'
+                        
+                        if start_iloc == 0:
+                            trip_start_index = trip_group.index[0]
+                            if context_df.loc[trip_start_index, 'marker'] == '':
+                                context_df.loc[trip_start_index, 'marker'] = '<-- TRIP START'
+                            else:
+                                context_df.loc[trip_start_index, 'marker'] += ' (TRIP START)'
+                        
+                        print("       Context for first OOR value:")
+                        indented_context = "\n".join([f"       {line}" for line in context_df.to_string().split('\n')])
+                        print(indented_context)
+
+            initial_row_count = len(df_filtered)
+            df_filtered = df_filtered[~out_of_range_mask]
+            print(f"\n   Dropped {initial_row_count - len(df_filtered)} rows for '{col}'.")
+
+    print(f"\nResult shape after range checks: {df_filtered.shape}")
+    return df_filtered, list(speed_violation_trip_ids)
+
+def find_inconsistent_sequences(df, trip_id_col, time_col, sequence_checks, max_details_to_print=10, context_window=5):
     """
-    Filters rows where specified columns have negative values.
-    Provides more detailed output on which columns caused rows to be dropped.
+    Finds and reports trips with inconsistent sequential data, returning detailed
+    information about each violation for programmatic correction.
+
+    Args:
+        df (pd.DataFrame): The input DataFrame. MUST be sorted by trip_id and timestamp.
+        trip_id_col (str): The name of the trip identifier column.
+        time_col (str): The name of the timestamp column.
+        sequence_checks (dict): Configuration for the checks.
+        max_details_to_print (int): Max number of trip IDs with issues to print.
+        context_window (int): Number of rows to show before and after the inconsistency.
+
+    Returns:
+        tuple: A tuple containing:
+            - pd.DataFrame: The original, unfiltered DataFrame.
+            - dict: A dictionary of trips with errors, where keys are trip IDs and
+                    values are lists of detailed error dictionaries.
     """
-    print("\n--- Filtering Negative Values ---")
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        print("Input DataFrame is empty or invalid. Skipping.")
+    print("\n--- Checking for Inconsistent Sequential Data ---")
+    if df.empty:
+        print("DataFrame is empty. Skipping check.")
+        return df, {}
+
+    trips_with_errors = {}
+    grouped = df.groupby(trip_id_col, observed=True)
+
+    for trip_id, trip_df in grouped:
+        if len(trip_df) < 2:
+            continue
+
+        errors_found_in_trip = []
+
+        for col, config in sequence_checks.items():
+            if col not in trip_df.columns:
+                continue
+
+            series = trip_df[col]
+            
+            # Prepare the series for checking.
+            if col == time_col:
+                numeric_series = pd.to_datetime(series, errors='coerce').astype(np.int64)
+                if numeric_series.isna().any():
+                    # This case is critical and should be handled, but for now, we'll just report.
+                    errors_found_in_trip.append({
+                        'message': f"'{col}' contains invalid timestamp values.",
+                        'context': '', 'column': col, 'violation_index': None,
+                        'pre_violation_index': None, 'pre_violation_value': None, 'violation_value': None
+                    })
+                    continue
+                series_to_check = numeric_series
+            else:
+                numeric_series = pd.to_numeric(series, errors='coerce')
+                series_to_check = numeric_series.dropna()
+
+            if len(series_to_check) < 2:
+                continue
+            
+            diffs = series_to_check.diff().dropna()
+            if diffs.empty:
+                continue
+
+            direction = config.get('direction')
+            tolerance = config.get('tolerance', 0)
+            strict = config.get('strict', False)
+
+            violations = pd.Series(False, index=diffs.index)
+            if direction == 'increasing':
+                limit = 0 if strict else -tolerance
+                violations = diffs < limit
+            elif direction == 'decreasing':
+                limit = 0 if strict else tolerance
+                violations = diffs > limit
+
+            if violations.any():
+                num_violations = violations.sum()
+                first_violation_original_idx = violations[violations].index[0]
+                
+                # Find the index of the last valid point *before* the violation
+                prev_valid_series = series_to_check[series_to_check.index < first_violation_original_idx]
+                if not prev_valid_series.empty:
+                    prev_violation_original_idx = prev_valid_series.index[-1]
+                    prev_val = series.loc[prev_violation_original_idx]
+                    curr_val = series.loc[first_violation_original_idx]
+                    
+                    error_msg = (f"'{col}' failed '{direction}' check ({num_violations} times). "
+                                 f"First violation at index {first_violation_original_idx}: value changed from {prev_val} to {curr_val}.")
+                    
+                    # Generate context for printing
+                    violation_iloc = trip_df.index.get_loc(first_violation_original_idx)
+                    start_iloc = max(0, violation_iloc - context_window)
+                    end_iloc = min(len(trip_df), violation_iloc + 1 + context_window)
+                    context_df = trip_df.iloc[start_iloc:end_iloc][[time_col, col]].copy()
+                    context_df['marker'] = ''
+                    context_df.loc[first_violation_original_idx, 'marker'] = '<-- VIOLATION'
+                    context_str = context_df.to_string()
+                    
+                    # Append detailed error information for programmatic use
+                    errors_found_in_trip.append({
+                        'message': error_msg,
+                        'context': context_str,
+                        'column': col,
+                        'violation_index': first_violation_original_idx,
+                        'pre_violation_index': prev_violation_original_idx,
+                        'pre_violation_value': prev_val,
+                        'violation_value': curr_val
+                    })
+
+        if errors_found_in_trip:
+            trips_with_errors[trip_id] = errors_found_in_trip
+
+    # --- Reporting ---
+    if trips_with_errors:
+        num_bad_trips = len(trips_with_errors)
+        print(f"Found {num_bad_trips} trips with sequential inconsistencies.")
+        print("   Detailed analysis:")
+        
+        count = 0
+        for trip_id, errors in trips_with_errors.items():
+            if count >= max_details_to_print:
+                print(f"   ... (details for remaining {num_bad_trips - count} trips omitted)")
+                break
+            print(f"\n   - Trip ID: {trip_id}")
+            for error_detail in errors:
+                print(f"     - {error_detail['message']}")
+                if error_detail['context']:
+                    indented_context = "\n".join([f"       {line}" for line in error_detail['context'].split('\n')])
+                    print(indented_context)
+            count += 1
+    else:
+        print("No trips with sequential inconsistencies found.")
+
+    return df, trips_with_errors
+
+def report_invalid_array_lengths(df, array_length_checks, trip_id_col='trip_id', time_col='timestamp', max_trips_to_print=10):
+    """
+    Reports trips and rows where array-like columns do not contain the expected number of samples.
+    This function is for reporting only and does not modify the DataFrame.
+
+    Args:
+        df (pd.DataFrame): The input DataFrame.
+        array_length_checks (dict): A dictionary where keys are column names and values are the
+                                    expected integer length of the array in that column.
+                                    Example: {'speed_array': 10, 'altitude_array': 10}
+        trip_id_col (str): The name of the trip identifier column for reporting.
+        time_col (str): The name of the timestamp column for identifying specific rows.
+        max_trips_to_print (int): The maximum number of trip IDs with issues to detail in the report.
+
+    Returns:
+        pd.DataFrame: The original, unmodified DataFrame.
+    """
+    print("\n--- Checking for Invalid Array Sample Counts ---")
+    if df.empty:
+        print("DataFrame is empty. Skipping check.")
         return df
 
-    initial_rows = len(df)
-    # Keep track of rows to drop based on checks for each column
-    rows_to_drop_indices = set()
-    # Keep track of how many rows are dropped due to each column check
-    drop_counts_per_col = {col: 0 for col in cols_to_check if col in df.columns}
+    # A dictionary to hold detailed error information, structured by trip_id
+    trips_with_errors = {}
 
-    for col in cols_to_check:
+    for col, expected_length in array_length_checks.items():
         if col not in df.columns:
-            print(f"Warning: Column '{col}' not found for negative value check. Skipping.")
+            print(f"Warning: Column '{col}' not found for array length check. Skipping.")
             continue
 
-        print(f"\n - Checking non-negativity for '{col}':")
-        is_array_like = df[col].iloc[0:min(100, len(df))].apply(lambda x: isinstance(x, (list, np.ndarray))).any()
-        col_to_evaluate = None # Series holding the values to check (original or mean)
+        print(f" - Checking array length for '{col}' (expected: {expected_length}).")
 
-        try:
-            if is_array_like:
-                print(f"   (Applying check to mean of array column '{col}')")
-                col_to_evaluate = df[col].apply(safe_mean)
-            else:
-                # Ensure scalar column is numeric
-                col_to_evaluate = pd.to_numeric(df[col], errors='coerce')
+        # Apply the helper to get a Series of actual lengths
+        actual_lengths = df[col].apply(get_array_length)
 
-            if col_to_evaluate is None: # Should not happen unless apply fails silently
-                 print(f"   Warning: Could not evaluate values for '{col}'. Skipping column.")
-                 continue
+        # Create a boolean mask for rows where the length is incorrect.
+        # We only care about actual arrays (length != -1) that don't match the expected length.
+        invalid_length_mask = (actual_lengths != -1) & (actual_lengths != expected_length)
 
-            # Identify rows where the evaluated value is negative (and not NaN)
-            negative_mask = (col_to_evaluate < 0) & col_to_evaluate.notna()
-            num_negative = negative_mask.sum()
+        if invalid_length_mask.any():
+            # Get the subset of the DataFrame with these errors for easier processing
+            error_df = df.loc[invalid_length_mask].copy()
+            error_df['actual_length'] = actual_lengths[invalid_length_mask]
 
-            if num_negative > 0:
-                print(f"   Found {num_negative} negative value(s) in '{col}'.")
-                # Add the indices of these rows to the set of rows to be dropped
-                rows_to_drop_indices.update(df.index[negative_mask])
-                drop_counts_per_col[col] = num_negative # Store count for this column
-            else:
-                 print(f"   No negative values found in '{col}'.")
+            print(f"   Found {len(error_df)} rows in '{col}' with incorrect array lengths.")
 
-        except Exception as e:
-            print(f"Warning: Error during negativity check for '{col}'. Skipping column. Error: {e}")
+            # Group by trip_id to collect all errors for each trip
+            for trip_id, group in error_df.groupby(trip_id_col, observed=True):
+                if trip_id not in trips_with_errors:
+                    trips_with_errors[trip_id] = []
 
-    # Filter the DataFrame by removing all identified rows at once
-    if rows_to_drop_indices:
-        num_unique_rows_to_drop = len(rows_to_drop_indices)
-        print(f"\nSummary of Negative Value Filtering:")
-        for col, count in drop_counts_per_col.items():
-            if count > 0:
-                print(f" - Column '{col}': {count} negative value(s) identified.")
-        print(f"Total unique rows to be removed due to negative values: {num_unique_rows_to_drop}")
-        df_filtered = df.drop(index=list(rows_to_drop_indices))
-    else:
-        print("\nNo rows needed removal based on negative value checks.")
-        df_filtered = df # No changes needed
-
-    print(f"\nResult shape after negative value checks: {df_filtered.shape} (Removed {initial_rows - len(df_filtered)} rows total)")
-    return df_filtered
-
-# --- (Keep and potentially enhance existing direction/difference filters) ---
-# Example Enhancements:
-# - filter_non_increasing_timestamps could also check for MAX_CONSECUTIVE_TIME_GAP_SECONDS
-# - filter_big_differences could be enhanced to calculate odo_diff and gps_dist if needed
-
-def filter_non_increasing_timestamps(df, trip_id_col, time_col, max_gap_seconds=None):
-    """Filters non-increasing timestamps and optionally large time gaps."""
-    print(f"\n--- Filtering Timestamp Sequence (Max Gap={max_gap_seconds}s) ---")
-    if not all(col in df.columns for col in [trip_id_col, time_col]):
-        print(f"Warning: Missing required columns. Skipping.")
-        return df
-    df = df.sort_values([trip_id_col, time_col])
-    df[time_col] = pd.to_datetime(df[time_col], errors='coerce')
-    initial_rows = len(df)
-    df.dropna(subset=[time_col], inplace=True)
-    if len(df) < initial_rows: print(f" - Dropped {initial_rows - len(df)} rows with invalid timestamps.")
-    if df.empty: return df
-
-    if pd.api.types.is_datetime64_any_dtype(df[time_col]):
-         df['time_diff_sec'] = df.groupby(trip_id_col)[time_col].diff().dt.total_seconds()
-    else:
-         print(f"Warning: Column '{time_col}' not datetime type.")
-         df['time_diff_sec'] = df.groupby(trip_id_col)[time_col].diff()
-
-    # Filter 1: Non-increasing timestamps
-    valid_mask = (df['time_diff_sec'] > 0) | df['time_diff_sec'].isna()
-    rows_dropped_noninc = (~valid_mask).sum()
-    if rows_dropped_noninc > 0: print(f" - Dropped {rows_dropped_noninc} rows due to non-increasing timestamps.")
-
-    # Filter 2: Large time gaps (optional)
-    rows_dropped_gap = 0
-    if max_gap_seconds is not None:
-        gap_mask = (df['time_diff_sec'] <= max_gap_seconds) | df['time_diff_sec'].isna()
-        rows_dropped_gap = (~gap_mask & valid_mask).sum() # Count only those not already dropped
-        if rows_dropped_gap > 0: print(f" - Dropped {rows_dropped_gap} rows due to time gap > {max_gap_seconds}s.")
-        valid_mask &= gap_mask
-
-    df_filtered = df[valid_mask].drop(columns=['time_diff_sec'])
-    print(f"Result shape: {df_filtered.shape}")
-    return df_filtered
-
-# --- NEW: Speed-Distance Consistency Check ---
-def filter_speed_distance_inconsistency(df, trip_id_col, time_col, odo_col, lat_col, lon_col, speed_col, tolerance_factor=1.5):
-    """Filters rows where distance covered seems inconsistent with speed and time."""
-    print(f"\n--- Filtering Speed/Distance Inconsistency (Tolerance={tolerance_factor}) ---")
-    required_cols = [trip_id_col, time_col, odo_col, lat_col, lon_col, speed_col]
-    if not all(col in df.columns for col in required_cols):
-        print(f"Warning: Missing required columns ({required_cols}). Skipping check.")
-        return df
-
-    df = df.sort_values([trip_id_col, time_col])
-
-    # Calculate time diff (ensure timestamp is datetime)
-    df[time_col] = pd.to_datetime(df[time_col], errors='coerce')
-    df['time_diff_sec_consist'] = df.groupby(trip_id_col)[time_col].diff().dt.total_seconds()
-
-    # Calculate odo diff
-    df[odo_col] = pd.to_numeric(df[odo_col], errors='coerce')
-    df['odo_diff_consist'] = df.groupby(trip_id_col)[odo_col].diff()
-
-    # Calculate GPS dist
-    df['prev_lat_consist'] = df.groupby(trip_id_col)[lat_col].shift(1)
-    df['prev_lon_consist'] = df.groupby(trip_id_col)[lon_col].shift(1)
-    gps_distances = []
-    for _, row in df.iterrows():
-        if pd.isna(row[lat_col]) or pd.isna(row[lon_col]) or pd.isna(row['prev_lat_consist']) or pd.isna(row['prev_lon_consist']):
-            gps_distances.append(np.nan) # Can't calculate distance if coords missing
+                for _, row in group.iterrows():
+                    error_info = {
+                        'column': col,
+                        'timestamp': row[time_col],
+                        'actual_length': int(row['actual_length']),
+                        'expected_length': expected_length
+                    }
+                    trips_with_errors[trip_id].append(error_info)
         else:
-            try: gps_distances.append(haversine_distance(row[lat_col], row[lon_col], row['prev_lat_consist'], row['prev_lon_consist']))
-            except: gps_distances.append(np.nan)
-    df['gps_dist_consist'] = gps_distances
-    df['gps_dist_consist'] = df['gps_dist_consist'].fillna(0) # Fill NaN distances with 0 for comparison
+            print(f"   All arrays in '{col}' have the correct length.")
 
-    # Calculate mean speed in m/s
-    df['mean_speed_mps_consist'] = df[speed_col].apply(safe_mean) * (1000/3600) # KPH to m/s
+    # --- Reporting Phase ---
+    if trips_with_errors:
+        num_bad_trips = len(trips_with_errors)
+        print(f"\nFound {num_bad_trips} trips containing rows with invalid array lengths.")
+        print("   Detailed analysis:")
 
-    # Calculate max plausible distance based on speed and time
-    # Use average speed between current and previous point for better estimate? Simpler: use current mean speed.
-    df['max_plausible_dist_m'] = df['mean_speed_mps_consist'] * df['time_diff_sec_consist'] * tolerance_factor * 1000 # Convert to km
+        count = 0
+        for trip_id, errors in trips_with_errors.items():
+            if count >= max_trips_to_print:
+                print(f"   ... (details for remaining {num_bad_trips - count} trips omitted)")
+                break
 
-    # Define inconsistency mask
-    # Inconsistent if odo diff > max plausible OR gps dist > max plausible
-    # Only apply check where time_diff > 0 and speed is not NaN
-    inconsistent_mask = (
-        (df['time_diff_sec_consist'] > 0) & df['mean_speed_mps_consist'].notna() &
-        (
-            (df['odo_diff_consist'].notna() & (df['odo_diff_consist'] > df['max_plausible_dist_m'])) |
-            (df['gps_dist_consist'].notna() & (df['gps_dist_consist'] > df['max_plausible_dist_m']))
-        )
-    )
-
-    rows_dropped = inconsistent_mask.sum()
-    if rows_dropped > 0:
-        print(f" - Dropped {rows_dropped} rows due to speed/distance inconsistency.")
-        # print("Examples of inconsistent rows:") # Optional debugging
-        # print(df[inconsistent_mask][['time_diff_sec_consist', 'odo_diff_consist', 'gps_dist_consist', 'mean_speed_mps_consist', 'max_plausible_dist_m']].head())
-
-    df_filtered = df[~inconsistent_mask].drop(columns=[
-        'time_diff_sec_consist', 'odo_diff_consist', 'prev_lat_consist',
-        'prev_lon_consist', 'gps_dist_consist', 'mean_speed_mps_consist',
-        'max_plausible_dist_m'
-    ])
-    print(f"Result shape: {df_filtered.shape}")
-    return df_filtered
-
-# --- NEW: Trip Start/End Consistency Check ---
-def filter_trip_start_end_inconsistency(df, trip_id_col, check_pairs):
-    """Filters entire trips where start/end values violate expected logic."""
-    print("\n--- Checking Trip Start/End Consistency ---")
-    if trip_id_col not in df.columns:
-        print(f"Warning: Trip ID column '{trip_id_col}' not found. Skipping check.")
-        return df
-
-    trips_to_drop = set()
-    required_cols = set([trip_id_col])
-    for start_col, end_col, _ in check_pairs:
-        required_cols.add(start_col)
-        required_cols.add(end_col)
-
-    if not required_cols.issubset(df.columns):
-         missing = required_cols - set(df.columns)
-         print(f"Warning: Missing columns required for start/end check: {missing}. Skipping.")
-         return df
-
-    # Get first/last non-NaN values per trip for the check columns
-    try:
-        grouped = df.groupby(trip_id_col)
-        first_vals = grouped.first() # Gets first non-NaN for all columns
-        last_vals = grouped.last()  # Gets last non-NaN for all columns
-    except Exception as e:
-        print(f"Warning: Error during groupby first/last aggregation. Skipping check. Error: {e}")
-        return df
-
-
-    for start_col, end_col, relationship in check_pairs:
-        print(f" - Checking: {end_col} {relationship.replace('_',' ')} {start_col}")
-        # Ensure columns are numeric for comparison
-        try:
-            start_series = pd.to_numeric(first_vals[start_col], errors='coerce')
-            end_series = pd.to_numeric(last_vals[end_col], errors='coerce')
-        except KeyError:
-             print(f"   Warning: Columns '{start_col}' or '{end_col}' missing after group aggregation. Skipping this pair.")
-             continue
-
-
-        if relationship == 'increase':
-            # End must be strictly greater than Start
-            inconsistent = start_series >= end_series
-        elif relationship == 'increase_allow_equal':
-            # End must be greater than or equal to Start
-            inconsistent = start_series > end_series
-        elif relationship == 'decrease':
-            # End must be strictly less than Start
-            inconsistent = start_series <= end_series
-        elif relationship == 'decrease_allow_equal':
-            # End must be less than or equal to Start
-            inconsistent = start_series < end_series
-        else:
-            print(f"Warning: Unknown relationship '{relationship}' specified. Skipping this pair.")
-            continue
-
-        # Add trip IDs that fail the check (ignoring trips where start or end was NaN)
-        failed_trips = inconsistent.index[inconsistent & start_series.notna() & end_series.notna()]
-        if not failed_trips.empty:
-             print(f"   Found {len(failed_trips)} trips failing {start_col}/{end_col} check.")
-             trips_to_drop.update(failed_trips.tolist())
-
-    if trips_to_drop:
-        num_to_drop = len(trips_to_drop)
-        print(f"Found {num_to_drop} trips failing start/end consistency checks.")
-        df_filtered = df[~df[trip_id_col].isin(trips_to_drop)].copy()
-        print(f"Result shape after removing inconsistent start/end trips: {df_filtered.shape}")
-        return df_filtered
+            print(f"\n   - Trip ID: {trip_id}")
+            # Sort errors by timestamp for chronological reporting
+            sorted_errors = sorted(errors, key=lambda x: x['timestamp'])
+            for error in sorted_errors:
+                print(f"     - Row at {error['timestamp']}: Column '{error['column']}' has "
+                      f"{error['actual_length']} samples (expected {error['expected_length']}).")
+            count += 1
     else:
-        print("No trips failed start/end consistency checks.")
-        print(f"Result shape: {df.shape}")
-        return df
+        print("No trips with invalid array sample counts found.")
 
-# --- (Keep filter_distance_from_route placeholder) ---
-def filter_distance_from_route(df):
-    """Filter based on distance from matched route (placeholder)."""
-    print("\n--- Filtering Distance From Route (Placeholder) ---")
-    print("Warning: filter_distance_from_route is a placeholder and not performing checks.")
-    print(f"Result shape: {df.shape}")
+    print(f"Result shape (unchanged): {df.shape}")
     return df
+
+def analyze_consecutive_values(df, trip_id_col, time_col, checks_config,
+                               lat_col=None, lon_col=None, h3_col=None,
+                               gap_flag_col=None,
+                               context_window=3, max_details_to_print=10):
+    """
+    Analyzes and reports violations in differences between consecutive values.
+    If `gap_flag_col` is provided, it will ignore between-row violations that
+    occur at a flagged time gap.
+    """
+    # Determine the title for the print block based on whether this is a filtering run
+    run_title = "--- Analyzing Consecutive Value Differences (Filtered for Gaps) ---" if gap_flag_col else "--- Analyzing Consecutive Value Differences (Initial Pass) ---"
+    print(f"\n{run_title}")
+
+    if df.empty:
+        print("DataFrame is empty. Skipping analysis.")
+        return {}
+
+    trips_with_violations = {}
+    grouped = df.groupby(trip_id_col, observed=True)
+
+    for trip_id, trip_df in grouped:
+        if len(trip_df) < 2:
+            continue
+
+        violations_found_in_trip = []
+
+        for col, config in checks_config.items():
+            # --- SPECIAL: Location Check using Haversine Distance ---
+            if col == 'location':
+                coords = []
+                if lat_col and lon_col and lat_col in trip_df.columns and lon_col in trip_df.columns:
+                    coords = list(zip(trip_df[lat_col], trip_df[lon_col]))
+                elif h3_col and h3_col in trip_df.columns:
+                    coords = [h3_to_latlon(h3_idx) for h3_idx in trip_df[h3_col]]
+                else:
+                    continue
+
+                valid_coords_with_indices = [
+                    (trip_df.index[i], coord) for i, coord in enumerate(coords)
+                    if not (pd.isna(coord[0]) or pd.isna(coord[1]))
+                ]
+
+                if len(valid_coords_with_indices) < 2:
+                    continue
+
+                indices, points = zip(*valid_coords_with_indices)
+                
+                distances = [
+                    haversine_distance(points[i-1][0], points[i-1][1], points[i][0], points[i][1])
+                    for i in range(1, len(points))
+                ]
+                distance_diffs = pd.Series(distances, index=indices[1:])
+                coord_str_series = pd.Series([f"({p[0]:.5f}, {p[1]:.5f})" for p in points], index=indices)
+
+                for check_type, limits in config.items():
+                    min_val, max_val = limits.get('min', -np.inf), limits.get('max', np.inf)
+                    _collect_violations(
+                        distance_diffs, check_type, min_val, max_val, violations_found_in_trip,
+                        violation_type='between-row', column_name='location', series=coord_str_series,
+                        trip_df=trip_df, gap_flag_col=gap_flag_col
+                    )
+                continue
+
+            # --- REGULAR: Column-based checks ---
+            if col not in trip_df.columns:
+                continue
+
+            series = trip_df[col]
+            is_array_col = any(isinstance(x, (list, np.ndarray)) for x in series.dropna().head())
+
+            # Part 1: Between-Row Violation Check
+            diffs = pd.Series(np.nan, index=trip_df.index)
+            if is_array_col:
+                get_first = lambda arr: arr[0] if isinstance(arr, (list, np.ndarray)) and len(arr) > 0 else np.nan
+                get_last = lambda arr: arr[-1] if isinstance(arr, (list, np.ndarray)) and len(arr) > 0 else np.nan
+                diffs = series.apply(get_first) - series.apply(get_last).shift(1)
+            elif col == time_col:
+                diffs = pd.to_datetime(series, errors='coerce').diff().dt.total_seconds()
+            else:
+                diffs = pd.to_numeric(series, errors='coerce').diff()
+
+            if not diffs.dropna().empty:
+                for check_type, limits in config.items():
+                    min_val, max_val = limits.get('min', -np.inf), limits.get('max', np.inf)
+                    _collect_violations(
+                        diffs, check_type, min_val, max_val, violations_found_in_trip,
+                        violation_type='between-row', column_name=col, series=series,
+                        trip_df=trip_df, gap_flag_col=gap_flag_col
+                    )
+
+            # Part 2: Within-Row Violation Check (unaffected by gap flag)
+            if is_array_col:
+                for row_idx, arr in series.dropna().items():
+                    if isinstance(arr, (list, np.ndarray)) and len(arr) > 1:
+                        internal_diffs = pd.Series(np.diff(arr))
+                        if not internal_diffs.dropna().empty:
+                            for check_type, limits in config.items():
+                                min_val, max_val = limits.get('min', -np.inf), limits.get('max', np.inf)
+                                _collect_violations(
+                                    internal_diffs, check_type, min_val, max_val, violations_found_in_trip,
+                                    violation_type='within-row', column_name=col, series=series,
+                                    row_index=row_idx, array_data=arr
+                                )
+
+        if violations_found_in_trip:
+            trips_with_violations[trip_id] = violations_found_in_trip
+
+    # --- Reporting Phase ---
+    _report_violations(trips_with_violations, grouped, time_col, context_window, max_details_to_print)
+    return trips_with_violations
+
+
+def _collect_violations(diffs, check_type, min_val, max_val, violation_list, violation_type, column_name, series,
+                        row_index=None, array_data=None, trip_df=None, gap_flag_col=None):
+    """Helper to find and format violation details, optionally skipping violations at time gaps."""
+    target_diffs = pd.Series(dtype=float)
+    if check_type == 'pos': target_diffs = diffs[diffs > 0]
+    elif check_type == 'neg': target_diffs = diffs[diffs < 0].abs()
+    elif check_type == 'both': target_diffs = diffs.abs()
+
+    violating_diffs = target_diffs[(target_diffs < min_val) | (target_diffs > max_val)]
+
+    for viol_idx, diff_val in violating_diffs.items():
+        # --- ADDED: Check to skip violations that occur at a known time gap ---
+        if violation_type == 'between-row' and gap_flag_col and trip_df is not None and gap_flag_col in trip_df.columns:
+            if trip_df.loc[viol_idx, gap_flag_col] == 1:
+                continue  # Skip this violation, it's expected due to the gap
+
+        details = {
+            'column': column_name, 'type': violation_type, 'check_rule': check_type,
+            'limit_broken': 'max' if abs(diff_val) > max_val else 'min',
+            'min_limit': min_val, 'max_limit': max_val, 'actual_diff': diffs[viol_idx]
+        }
+        if violation_type == 'between-row':
+            prev_row_loc = series.index.get_loc(viol_idx) - 1
+            details['row_index'] = viol_idx
+            details['prev_row_index'] = series.index[prev_row_loc]
+            details['value1'] = series.loc[details['prev_row_index']]
+            details['value2'] = series.loc[details['row_index']]
+        elif violation_type == 'within-row':
+            details['row_index'] = row_index
+            details['array_index'] = viol_idx
+            details['value1'] = array_data[viol_idx]
+            details['value2'] = array_data[viol_idx + 1]
+        violation_list.append(details)
+
+def _report_violations(trips_with_violations, grouped, time_col, context_window, max_details_to_print):
+    """Helper to print a formatted report of all found violations."""
+    if not trips_with_violations:
+        print("No consecutive value violations found in this pass.")
+        return
+
+    num_bad_trips = len(trips_with_violations)
+    print(f"Found {num_bad_trips} trips with violations in this pass.")
+    
+    count = 0
+    for trip_id, violations in trips_with_violations.items():
+        if count >= max_details_to_print:
+            print(f"\n   ... (details for remaining {num_bad_trips - count} trips omitted)")
+            break
+        
+        print(f"\n--- Trip ID: {trip_id} ---")
+        sorted_violations = sorted(violations, key=lambda x: (x['row_index'], x.get('array_index', -1)))
+        
+        for v in sorted_violations:
+            print(f"  - Type: {v['type']}, Column: '{v['column']}', Rule: '{v['check_rule']}'")
+            diff_format = ".4f" if v['column'] == 'location' else ".2f"
+            print(f"    - Violation: Change of {v['actual_diff']:{diff_format}} broke limit (Min: {v['min_limit']}, Max: {v['max_limit']})")
+
+            if v['type'] == 'between-row':
+                trip_df = grouped.get_group(trip_id)
+                if v['column'] == 'location':
+                    print("    Context (Location):")
+                    prev_time = trip_df.loc[v['prev_row_index'], time_col]
+                    curr_time = trip_df.loc[v['row_index'], time_col]
+                    print(f"      {prev_time} -> {v['value1']}  <-- PREVIOUS")
+                    print(f"      {curr_time} -> {v['value2']}  <-- VIOLATION")
+                else:
+                    viol_iloc = trip_df.index.get_loc(v['row_index'])
+                    start_iloc = max(0, viol_iloc - context_window)
+                    end_iloc = min(len(trip_df), viol_iloc + context_window + 1)
+                    
+                    context_df = trip_df.iloc[start_iloc:end_iloc][[time_col, v['column']]].copy()
+                    context_df['marker'] = ''
+                    context_df.loc[v['row_index'], 'marker'] = '<-- VIOLATION'
+                    context_df.loc[v['prev_row_index'], 'marker'] = '<-- PREVIOUS'
+                    print("    Context (Rows):")
+                    print("\n".join([f"      {line}" for line in context_df.to_string().split('\n')]))
+
+            elif v['type'] == 'within-row':
+                arr = grouped.get_group(trip_id).loc[v['row_index'], v['column']]
+                arr_idx = v['array_index']
+                start_idx = max(0, arr_idx - context_window)
+                end_idx = min(len(arr), arr_idx + context_window + 2)
+                
+                print(f"    Context (Within array at {time_col} {grouped.get_group(trip_id).loc[v['row_index'], time_col]}):")
+                for i in range(start_idx, end_idx):
+                    marker = ''
+                    if i == arr_idx: marker = '<-- V1'
+                    elif i == arr_idx + 1: marker = '<-- V2'
+                    print(f"      Index {i}: {arr[i]:<10.2f} {marker}")
+        count += 1
+
+def identify_skipped_rows(df: pd.DataFrame, trip_id_col: str, time_col: str, context_window: int = 4) -> list:
+    """
+    Analyzes a DataFrame to find and return the indices of rows that appear to be
+    glitches between two otherwise valid 60-second interval points.
+
+    It detects patterns where the time difference between a row 'x' and row 'x+2'
+    or 'x+3' is exactly 60 seconds, and returns the indices of the rows in between.
+
+    Args:
+        df (pd.DataFrame): The input DataFrame. MUST be sorted by trip_id and timestamp
+                           with a reset index.
+        trip_id_col (str): The name of the trip identifier column.
+        time_col (str): The name of the timestamp column.
+        context_window (int): The number of rows to show in the diagnostic printout.
+
+    Returns:
+        list: A sorted list of unique DataFrame indices corresponding to the rows
+              that should be removed.
+    """
+    print("\n--- Identifying Rows from Likely Skipped Timestamps ---")
+
+    if df.empty or time_col not in df.columns or trip_id_col not in df.columns:
+        print("DataFrame is empty or missing required columns. Skipping.")
+        return []
+
+    df_copy = df.copy()
+    df_copy[time_col] = pd.to_datetime(df_copy[time_col], errors='coerce')
+
+    grouped = df_copy.groupby(trip_id_col, observed=True)
+    t_plus_2 = grouped[time_col].shift(-2)
+    t_plus_3 = grouped[time_col].shift(-3)
+
+    delta_to_t2 = (t_plus_2 - df_copy[time_col]).dt.total_seconds()
+    delta_to_t3 = (t_plus_3 - df_copy[time_col]).dt.total_seconds()
+
+    # Find the starting points of the patterns
+    pattern_t2_starts = df_copy.index[delta_to_t2 == 60.0]
+    pattern_t3_starts = df_copy.index[delta_to_t3 == 60.0]
+
+    if pattern_t2_starts.empty and pattern_t3_starts.empty:
+        print("No instances of the specific skipped timestamp pattern were found.")
+        return []
+
+    # Use a set to automatically handle overlaps and duplicates
+    indices_to_remove = set()
+
+    # Collect indices for the t+2 pattern (remove row x+1)
+    for idx in pattern_t2_starts:
+        indices_to_remove.add(idx + 1)
+
+    # Collect indices for the t+3 pattern (remove rows x+1 and x+2)
+    for idx in pattern_t3_starts:
+        indices_to_remove.add(idx + 1)
+        indices_to_remove.add(idx + 2)
+
+    print(f"Identified {len(indices_to_remove)} unique rows for removal based on the pattern.")
+
+    # --- Optional: Print context for verification ---
+    all_pattern_starts = sorted(list(set(pattern_t2_starts.tolist() + pattern_t3_starts.tolist())))
+    flagged_trips = df_copy.loc[all_pattern_starts, trip_id_col].unique()
+
+    for trip_id in flagged_trips[:5]: # Limit printing to first 5 affected trips
+        print(f"\n--- Context for Trip ID: {trip_id} ---")
+        trip_df = df_copy[df_copy[trip_id_col] == trip_id]
+        trip_pattern_starts = [idx for idx in all_pattern_starts if df_copy.loc[idx, trip_id_col] == trip_id]
+
+        for idx in trip_pattern_starts:
+            reason = ""
+            if idx in pattern_t2_starts: reason = "(t+2 is 60s away)"
+            elif idx in pattern_t3_starts: reason = "(t+3 is 60s away)"
+            
+            print(f"\n  - Pattern starts at index {idx} {reason}")
+            
+            row_loc = trip_df.index.get_loc(idx)
+            start_iloc = max(0, row_loc - 1)
+            end_iloc = min(len(trip_df), row_loc + context_window)
+            context_df = trip_df.iloc[start_iloc:end_iloc].copy()
+            
+            context_df['marker'] = ''
+            context_df.loc[idx, 'marker'] = '<-- PATTERN START'
+            # Mark the rows that would be removed
+            for i in range(1, 3):
+                if (idx + i) in indices_to_remove and (idx + i) in context_df.index:
+                    context_df.loc[idx + i, 'marker'] = '<-- TO BE REMOVED'
+
+            display_cols = [col for col in [time_col, 'current_odo', 'current_soc', 'marker'] if col in context_df.columns]
+            print(context_df[display_cols].to_string())
+
+    if len(flagged_trips) > 5:
+        print(f"\n... (Context printing omitted for {len(flagged_trips) - 5} more trips) ...")
+
+    return sorted(list(indices_to_remove))
+
+def print_multi_gap_contexts(df, trip_id_col, time_col, gap_flag_col, context_window=5, max_prints=10):
+    """
+    Finds and prints the context for rows where more than one 'gap' flag
+    appears within a specified context window.
+
+    This is useful for diagnosing areas with multiple consecutive data quality issues.
+
+    Args:
+        df (pd.DataFrame): The input DataFrame, which should contain the gap flag column.
+        trip_id_col (str): The name of the trip identifier column.
+        time_col (str): The name of the timestamp column for context.
+        gap_flag_col (str): The name of the boolean/integer column indicating a gap (e.g., 'is_start_after_gap').
+        context_window (int): The number of rows to show before and after a flagged row.
+        max_prints (int): The maximum number of distinct context blocks to print to avoid flooding the output.
+    """
+    # 1. Basic validation to ensure required columns exist.
+    required_cols = [trip_id_col, time_col, gap_flag_col]
+    if not all(col in df.columns for col in required_cols):
+        print(f"Warning: DataFrame is missing one or more required columns: {required_cols}. Aborting.")
+        return
+
+    # 2. Find all rows that are flagged as gaps.
+    gap_rows = df[df[gap_flag_col] == 1]
+    if gap_rows.empty:
+        print("No rows with the gap flag were found.")
+        return
+
+    print(f"\n--- Analyzing Contexts for Multiple Gaps (Window: +/- {context_window} rows) ---")
+
+    # 3. Keep track of indices we've already printed to avoid duplicate blocks.
+    printed_indices = set()
+    prints_count = 0
+
+    # 4. Iterate through each identified gap row.
+    for idx, gap_row in gap_rows.iterrows():
+        if idx in printed_indices:
+            continue
+
+        if prints_count >= max_prints:
+            print(f"\n... Reached max prints limit of {max_prints}. Aborting further analysis.")
+            break
+
+        # 5. Define the context for the current gap by looking at its trip.
+        trip_id = gap_row[trip_id_col]
+        trip_df = df[df[trip_id_col] == trip_id]
+
+        try:
+            # Get the integer position (iloc) of our current gap row within its trip.
+            row_iloc = trip_df.index.get_loc(idx)
+        except KeyError:
+            # This can happen if the index is not unique within the trip, though it shouldn't
+            # with proper preprocessing. We skip if the index is not found.
+            continue
+
+        # Define the window slice using integer locations.
+        start_iloc = max(0, row_iloc - context_window)
+        end_iloc = min(len(trip_df), row_iloc + context_window + 1)
+        context_df = trip_df.iloc[start_iloc:end_iloc]
+
+        # 6. Check if this context contains more than one gap.
+        gaps_in_context = context_df[gap_flag_col].sum()
+
+        if gaps_in_context > 1:
+            prints_count += 1
+            print(f"\n--- Multi-Gap Context Found in Trip ID: {trip_id} (around index {idx}) ---")
+
+            # Prepare a list of relevant columns for a clean printout.
+            display_cols = [time_col, 'current_odo', 'current_soc', gap_flag_col]
+            # Filter to only columns that actually exist in the DataFrame.
+            display_cols_exist = [col for col in display_cols if col in context_df.columns]
+
+            print(context_df[display_cols_exist].to_string())
+
+            # 7. Add all indices from this printed context to the set to avoid re-printing this block.
+            printed_indices.update(context_df.index)
+
+    if prints_count == 0:
+        print("No contexts with multiple gaps were found.")
+    else:
+        print(f"\n--- Analysis Complete. Found and printed {prints_count} multi-gap contexts. ---")
 
 # --- Main Execution Logic ---
 def main():
@@ -968,30 +1399,6 @@ def main():
     print(f"--- Starting Preprocessing Pipeline ---")
     print(f"\nInput file: {INPUT_FILE_PATH}")
     print(f"Output file: {OUTPUT_FILE_PATH}")
-
-    # # --- Load Land Geometry (Do this ONCE) ---
-    # land_geom = None
-    # try:
-    #     print(f"\n--- Loading Land Shapefile ---")
-    #     print(f"Path: {LAND_SHAPEFILE_PATH}")
-    #     # Check if file exists before trying to load
-    #     if not os.path.exists(LAND_SHAPEFILE_PATH):
-    #          raise FileNotFoundError(f"Shapefile not found at: {LAND_SHAPEFILE_PATH}")
-    #     world = gpd.read_file(LAND_SHAPEFILE_PATH)
-    #     # Ensure it's in WGS84 (EPSG:4326) to match lat/lon
-    #     if world.crs != "EPSG:4326":
-    #          print(f"Converting shapefile CRS from {world.crs} to EPSG:4326...")
-    #          world = world.to_crs("EPSG:4326")
-    #     print("Unifying land geometry...")
-    #     land_geom = world.geometry.union_all()
-    #     print("Land geometry loaded and unified.")
-    # except ImportError:
-    #     print("Warning: GeoPandas not found. Cannot perform GPS land check.")
-    # except FileNotFoundError as e:
-    #      print(f"Warning: {e}. Cannot perform GPS land check.")
-    # except Exception as e:
-    #     print(f"Warning: Error loading or processing land shapefile: {e}. Cannot perform GPS land check.")
-    # # ------------------------------------------
 
     try:
         # 1. Load Data
@@ -1018,6 +1425,26 @@ def main():
         print(f"Columns after renaming: {df.columns.tolist()}")
         # --- Apply Preprocessing Steps Sequentially ---
 
+        # Convert timestamp to datetime and sort the data
+        print("\n--- Converting Timestamp and Sorting Data ---")
+        df[TIME_COL] = pd.to_datetime(df[TIME_COL], errors='coerce')
+        initial_rows = len(df)
+        df.dropna(subset=[TIME_COL], inplace=True)
+        if len(df) < initial_rows:
+            print(f"Dropped {initial_rows - len(df)} rows with invalid timestamps.")
+
+        
+        df = df.sort_values(by=[TRIP_ID_COL, TIME_COL], ascending=True).reset_index(drop=True)
+        print(f"Data sorted by trip and time. Shape: {df.shape}")
+
+        # Report Invalid Array Lengths (Row Level)
+        array_length_checks = {
+            SPEED_ARRAY_COL: EXPECTED_SPEED_ARRAY_SAMPLES,
+            ALT_ARRAY_COL: EXPECTED_ALT_ARRAY_SAMPLES
+        }
+        # This function only reports and does not filter, so we don't reassign df
+        report_invalid_array_lengths(df, array_length_checks, trip_id_col=TRIP_ID_COL, time_col=TIME_COL)
+
         # 3. Convert H3 Index to Lat/Lon (Add this step early)
         print(f"\n--- Converting H3 Index ('{H3_COL}') to Lat/Lon ---")
         if H3_COL in df.columns:
@@ -1038,7 +1465,7 @@ def main():
         print(f"Shape after H3 conversion: {df.shape}")
         # ----------------------------------------------------
 
-        # *** 8. Validate and Filter Lat/Lon (includes trip filter) *** 
+        # 4. Validate and Filter Lat/Lon (includes trip filter) *** 
         df = validate_and_filter_latlon(
             df,
             lat_col=LAT_COL,
@@ -1049,7 +1476,44 @@ def main():
             filter_mostly_zero_trips=FILTER_MOSTLY_ZERO_TRIPS,
             zero_trip_threshold=ZERO_TRIP_THRESHOLD
         )
-        # **********************************************************
+
+        if VALIDATE_POINTS_IN_AREA:
+            # 5. Validate and Filter Lat/Lon in target countries.
+            # Define the countries of interest (Corsica is part of France).
+            TARGET_COUNTRY_CODES = ['FRA', 'LUX', 'BEL', 'DNK', 'CHE', 'NLD', 'PRT', 'ITA', 'UKR', 'DEU', 'GRC', 'NOR', 'HUN']
+
+            # Get the geometry using the new GADM function
+            # Note: A smaller buffer is needed because the data is more accurate
+            target_area_geometry = get_gadm_countries_geometry(
+                gadm_directory=GADM_FOLDER_PATH,
+                country_iso_codes=TARGET_COUNTRY_CODES,
+                buffer_meters=500 # Start with a smaller buffer (e.g., 500m)
+            )
+
+            # Step 2: Run the check if the geometry was loaded successfully
+            if target_area_geometry:
+                print("\n--- Identifying points outside the target area ---")
+                outside_points_df = find_points_outside_target_area(
+                    df=df,
+                    target_geometry=target_area_geometry,
+                    trip_id_col=TRIP_ID_COL, lat_col=LAT_COL, lon_col=LON_COL
+                )
+
+                print("\n--- Results: Trip ID and Coordinates of Points OUTSIDE Target Area ---")
+                if not outside_points_df.empty:
+                    print(outside_points_df)
+                else:
+                    print("No points were found outside the target area.")
+            else:
+                print("\nSkipping location checks because the target area geometry could not be created.")
+
+        # 1. Dropping the Guadeloupe trip as it's an overseas territory, outside the European geographical scope.
+        print("Dropping the Guadeloupe trip as it's an overseas territory, outside the European geographical scope.")
+        df = df[df['trip_id'] != 'eb1f4e33-a91a-5556-abf6-59a5975e204e']
+
+        # 2. Dropping the Marseille trip due to a large GPS gap, indicating an incomplete, non-driving event (e.g., a ferry).
+        print("Dropping the Marseille trip due to a large GPS gap, indicating an incomplete, non-driving event (e.g., a ferry).")
+        df = df[df['trip_id'] != '8de496a7-fdb8-56e3-8b6d-630636d1fae8']
 
         # 3. Check Trip Static Data Consistency (Trip Level)
         df = filter_inconsistent_trip_data(df, trip_id_col=TRIP_ID_COL, cols_to_check=STATIC_TRIP_COLS)
@@ -1063,10 +1527,17 @@ def main():
         # 6. Remove Constant/All-NaN Columns
         df = remove_constant_cols(df)
 
-        # *** Apply GPS Land Filter ***
-        # Pass the standard LAT_COL and LON_COL names
-        # df = filter_gps_at_sea(df, land_geom=land_geom, lat_col=LAT_COL, lon_col=LON_COL)
+        # Identify and remove rows that match the "skipped sample" pattern.
+        indices_to_drop = identify_skipped_rows(df, trip_id_col=TRIP_ID_COL, time_col=TIME_COL)
 
+        if indices_to_drop:
+            print(f"\n--- Removing {len(indices_to_drop)} identified glitch rows ---")
+            df.drop(index=indices_to_drop, inplace=True)
+            # CRITICAL: Reset the index after dropping rows to ensure continuity for subsequent steps.
+            df.reset_index(drop=True, inplace=True)
+            print(f"Shape after removing glitch rows: {df.shape}")
+
+        _ = identify_skipped_rows(df, trip_id_col=TRIP_ID_COL, time_col=TIME_COL)    
         # --- Fetch Weather Data ---
         if FETCH_WEATHER_DATA:
             print("\n--- Fetching External Weather Data (Row-by-Row) ---")
@@ -1106,63 +1577,332 @@ def main():
         range_checks = {
             SOC_COL: (MIN_VALID_SOC, MAX_VALID_SOC),
             VEHICLE_TEMP_COL: (MIN_VALID_TEMP, MAX_VALID_TEMP),
-            ALT_ARRAY_COL: (MIN_VALID_ALTITUDE, MAX_VALID_ALTITUDE), # Checks mean
+            ALT_ARRAY_COL: (MIN_VALID_ALTITUDE, MAX_VALID_ALTITUDE),
             BATT_HEALTH_COL: (MIN_VALID_BATT_HEALTH, MAX_VALID_BATT_HEALTH),
             ODO_COL: (0, MAX_VALID_ODO), # Odo should start >= 0
             WEIGHT_COL: (MIN_VALID_WEIGHT, MAX_VALID_WEIGHT),
-            LAT_COL: (-90, 90), # Add Lat check
-            LON_COL: (-180, 180), # Add Lon check
-            # Add speed range check if desired (checking mean of speed_array)
-            SPEED_ARRAY_COL: (0, 250) # Example: 0 to 250 kph for mean speed
+            SPEED_ARRAY_COL: (MIN_VALID_SPEED, MAX_VALID_SPEED)
         }
-        df = filter_unrealistic_ranges(df, range_checks)
 
-        # 8. Filter Negative Values (Row Level) - Extended
-        cols_must_be_non_negative = [
-            ODO_COL, BATT_HEALTH_COL, WEIGHT_COL,
-            SPEED_ARRAY_COL # Checks mean
+        df, speed_outlier_trip_ids = filter_unrealistic_ranges(
+            df, 
+            range_checks, 
+            trip_id_col=TRIP_ID_COL, 
+            max_details_to_print=5,
+            plot_output_dir=SPEED_OUTLIERS_PLOT_DIR # Pass the directory path here
+        )
+
+        # The list of speed outlier trip IDs is now returned by the function above.
+        # Manually dropping the identified trips.
+        if speed_outlier_trip_ids:
+            initial_trip_count = df[TRIP_ID_COL].nunique()
+            print(f"\n--- Removing {len(speed_outlier_trip_ids)} trips with speed sensor errors ---")
+            print(f"Initial number of unique trips before removal: {initial_trip_count}")
+
+            df = df[~df[TRIP_ID_COL].isin(speed_outlier_trip_ids)].copy()
+
+            final_trip_count = df[TRIP_ID_COL].nunique()
+            print(f"Dropped {initial_trip_count - final_trip_count} trips.")
+            print(f"Final number of unique trips: {final_trip_count}")
+        else:
+            print("\n--- No trips identified for removal due to speed sensor errors ---")
+
+        df, speed_outlier_trip_ids = filter_unrealistic_ranges(
+            df, 
+            range_checks, 
+            trip_id_col=TRIP_ID_COL, 
+            max_details_to_print=5,
+            plot_output_dir=SPEED_OUTLIERS_PLOT_DIR # Pass the directory path here
+        )
+
+        # 9. Filter Inconsistent Sequences (Trip Level)
+        sequence_checks = {
+            ODO_COL: {'direction': 'increasing', 'strict': True}, # Allow for minor float inaccuracies
+            # SOC_COL: {'direction': 'decreasing', 'strict': True}, can increase due to regenerative braking
+            BATT_HEALTH_COL: {'direction': 'decreasing', 'strict': True},
+            TIME_COL: {'direction': 'increasing', 'strict': True} # Ensure time is strictly increasing
+        }
+        df, trips_with_errors = find_inconsistent_sequences(df, TRIP_ID_COL, TIME_COL, sequence_checks)
+
+        # --- DYNAMIC CORRECTION BLOCK ---
+        if trips_with_errors:
+            print("\n--- Applying Dynamic Corrections for Sequential Errors ---")
+            
+            indices_to_drop = []
+            # Flatten the list of all errors from all trips
+            all_errors = [(trip_id, error) for trip_id, trip_errors in trips_with_errors.items() for error in trip_errors]
+
+            for trip_id, error_details in all_errors:
+                col_name = error_details['column']
+                violation_idx = error_details['violation_index']
+
+                # Handle Odometer Glitch (Drop the single erroneous row)
+                if col_name == ODO_COL:
+                    print(f"\n - Found Odometer glitch in trip '{trip_id}'.")
+                    print(f"   - Marking row with index {violation_idx} for removal.")
+                    if violation_idx is not None:
+                        indices_to_drop.append(violation_idx)
+
+                # Handle Battery Health Jump (Forward-fill from the last good value)
+                elif col_name == BATT_HEALTH_COL:
+                    pre_violation_idx = error_details['pre_violation_index']
+                    if pre_violation_idx is not None and violation_idx is not None:
+                        last_good_val = df.loc[pre_violation_idx, BATT_HEALTH_COL]
+                        
+                        print(f"\n - Found Battery Health jump in trip '{trip_id}'.")
+                        print(f"   - Correcting '{BATT_HEALTH_COL}' from index {violation_idx} onwards to value {last_good_val}.")
+                        
+                        trip_mask = df[TRIP_ID_COL] == trip_id
+                        onwards_mask = df.index >= violation_idx
+                        df.loc[trip_mask & onwards_mask, BATT_HEALTH_COL] = last_good_val
+                        
+                        print("   Context after fix:")
+                        trip_df = df[df[TRIP_ID_COL] == trip_id]
+                        try:
+                            iloc = trip_df.index.get_loc(violation_idx)
+                            print(trip_df.iloc[max(0, iloc-5):min(len(trip_df), iloc+6)][[TIME_COL, BATT_HEALTH_COL]].to_string())
+                        except KeyError:
+                            print(f"     Index {violation_idx} no longer exists for context view.")
+
+            # Drop all collected indices at once for safety
+            if indices_to_drop:
+                print(f"\n--- Dropping {len(indices_to_drop)} rows due to Odometer glitches ---")
+                # Ensure indices are unique and exist before dropping
+                valid_indices_to_drop = [idx for idx in set(indices_to_drop) if idx in df.index]
+                print(f"Dropping valid indices: {valid_indices_to_drop}")
+                df = df.drop(index=valid_indices_to_drop).reset_index(drop=True)
+                print(f"Shape after dropping rows: {df.shape}")
+
+            print("\n--- Re-running Sequence Check After Dynamic Fixes ---")
+            df, _ = find_inconsistent_sequences(df, TRIP_ID_COL, TIME_COL, sequence_checks)
+        # --- END DYNAMIC CORRECTION BLOCK ---
+
+        ########################### Misalignment Report Helpers #########################################
+
+        # first creat a lookup table for battery_capacity_kWh
+        BATTERY_LOOKUP = [
+            # ─── small- and mid-size e-CMP cars ────────────────────────────
+            {"car_model": "208 V2 (P21)",                 "manufacturer": "PEUGEOT", "battery_type": "L2 640 60AH EF 640 EN",         "battery_capacity_kWh": 50.0},
+            {"car_model": "2008 V2 (P24)",                "manufacturer": "PEUGEOT", "battery_type": "L2 640 60AH EF 640 EN",         "battery_capacity_kWh": 50.0},
+            {"car_model": "C4 V3 (C41E)",                 "manufacturer": "CITROEN", "battery_type": "L2 640 60AH EF 640 EN",         "battery_capacity_kWh": 50.0},
+            {"car_model": "DS3 CROSSBACK (D34)",          "manufacturer": "DS",      "battery_type": "L2 640 60AH EF 640 EN",         "battery_capacity_kWh": 50.0},
+            {"car_model": "C4X (C43E)",                   "manufacturer": "CITROEN", "battery_type": "L2 640 60AH EF 640 EN",         "battery_capacity_kWh": 50.0},
+            {"car_model": "308 V3 (P512)",                "manufacturer": "PEUGEOT", "battery_type": "L3 720 70AH EF 720 EN",         "battery_capacity_kWh": 54.0},
+
+            # ─── e-K9 vans (Berlingo / Rifter / Partner) ───────────────────
+            {"car_model": "BERLINGO (K9 EUROPE)",         "manufacturer": "CITROEN", "battery_type": "L2 640 60AH EF 640 EN",         "battery_capacity_kWh": 52.0},
+            {"car_model": "RIFTER / PARTNER (K9 EUROPE)", "manufacturer": "PEUGEOT", "battery_type": "L2 640 60AH EF 640 EN",         "battery_capacity_kWh": 52.0},
+            {"car_model": "RIFTER / PARTNER (K9 EUROPE)", "manufacturer": "PEUGEOT", "battery_type": "L3 760 70AH EFBC 760 EN EFBC",  "battery_capacity_kWh": 52.0},  # ← NEW
+
+            # ─── larger K0 vans (Spacetourer / Traveller / Expert / Jumpy) ─
+            {"car_model": "TRAVELLER / EXPERT 4 (K0)",    "manufacturer": "PEUGEOT", "battery_type": "L2 640 640 EN",                 "battery_capacity_kWh": 50.0},
+            {"car_model": "SPACETOURER / JUMPY 4 (K0)",   "manufacturer": "CITROEN", "battery_type": "L2 640 640 EN",                 "battery_capacity_kWh": 50.0},
+            {"car_model": "SPACETOURER / JUMPY 4 (K0)",   "manufacturer": "CITROEN", "battery_type": "L3 760 70AH EFBC 760 EN EFBC",  "battery_capacity_kWh": 75.0},
+            {"car_model": "TRAVELLER / EXPERT 4 (K0)",    "manufacturer": "PEUGEOT", "battery_type": "L3 760 70AH EFBC 760 EN EFBC",  "battery_capacity_kWh": 75.0},
         ]
-        df = filter_negative_values_extended(df, cols_to_check=cols_must_be_non_negative)
 
-        # 9. Timestamp Checks (Row Level) - Includes Max Gap
-        #df = filter_non_increasing_timestamps(df, trip_id_col=TRIP_ID_COL, time_col=TIME_COL, max_gap_seconds=MAX_CONSECUTIVE_TIME_GAP_SECONDS)
+        lookup_df = pd.DataFrame(BATTERY_LOOKUP)
 
-        # 10. Odometer Direction Check (Row Level)
-        #df = filter_decreasing_odometer(df, odo_col=ODO_COL, trip_id_col=TRIP_ID_COL, time_col=TIME_COL)
+        def _clean_series(s: pd.Series) -> pd.Series:
+            return (
+                s.astype(str)
+                .str.replace(r"\s+", " ", regex=True)   # collapse multiple spaces
+                .str.replace(r"[^\x00-\x7F]+", " ", regex=True)  # strip non-ASCII artifacts
+                .str.strip()
+            )
 
-        # 11. SoC Direction Check (Row Level)
-        #df = filter_increasing_soc(df, soc_col=SOC_COL, trip_id_col=TRIP_ID_COL, time_col=TIME_COL, threshold=SOC_INCREASE_THRESHOLD)
+        df["car_model"]      = _clean_series(df["car_model"])
+        df["manufacturer"]   = _clean_series(df["manufacturer"])
+        df["battery_type"]   = _clean_series(df["battery_type"])
+        lookup_df["car_model"]    = _clean_series(lookup_df["car_model"])
+        lookup_df["manufacturer"] = _clean_series(lookup_df["manufacturer"])
+        lookup_df["battery_type"] = _clean_series(lookup_df["battery_type"])
 
-        # 12. GPS Checks (Now uses the created LAT_COL, LON_COL)
-        #df = filter_gps_over_sea(df, lat_col=LAT_COL, lon_col=LON_COL) 
-        #df = filter_big_jumps(df, max_distance_km=MAX_GPS_JUMP_KM, lat_col=LAT_COL, lon_col=LON_COL, trip_id_col=TRIP_ID_COL, time_col=TIME_COL)
+        df = df.merge(
+            lookup_df,
+            on=["car_model", "manufacturer", "battery_type"],
+            how="left"
+        )
+
+        # reset the index to resolve any duplicates created by the merge.
+        df = df.reset_index(drop=True)
+
+        missing = df["battery_capacity_kWh"].isna().sum()
+        print(f"\nRows still missing battery_capacity_kWh after merge: {missing}")
         
-        # 13. Big Difference Checks (Row Level) - Enhanced to use means for arrays
-        #df = filter_big_differences(df, trip_id_col=TRIP_ID_COL, time_col=TIME_COL,
-                                    # speed_col=SPEED_ARRAY_COL, alt_col=ALT_ARRAY_COL, soc_col=SOC_COL, temp_col=TEMP_COL,
-                                    # max_speed_diff=MAX_CONSECUTIVE_SPEED_DIFF, max_alt_diff=MAX_CONSECUTIVE_ALT_DIFF,
-                                    # max_soc_diff=MAX_CONSECUTIVE_SOC_DIFF, max_temp_diff=MAX_CONSECUTIVE_TEMP_DIFF)
+        # # --- 2. Define Configuration and Rules ---
+        # CONFIG = MisalignmentConfig(
+        #     trip_id=TRIP_ID_COL, time=TIME_COL, lat=LAT_COL, lon=LON_COL, odo=ODO_COL,
+        #     speed_array=SPEED_ARRAY_COL, soc=SOC_COL, alt_array=ALT_ARRAY_COL,
+        #     battery_capacity_kWh_col="battery_capacity_kWh"
+        # )
 
-        # 14. Speed/Distance Consistency Check (Row Level)
-        #df = filter_speed_distance_inconsistency(df, trip_id_col=TRIP_ID_COL, time_col=TIME_COL,
-                                                # odo_col=ODO_COL, lat_col=LAT_COL, lon_col=LON_COL,
-                                                # speed_col=SPEED_ARRAY_COL, tolerance_factor=SPEED_DIST_TOLERANCE_FACTOR)
+        # # Define the list of rules to apply.
+        # all_rules = [
+        #     # A. Foundational Data Integrity
+        #     time_gap_rule(min_s=59.0, max_s=61.0),
+        #     simple_threshold_rule(name="Odo_Regress", col="Δ_odo_km", threshold=-0.05, op='lt'),
+        #     simple_threshold_rule(name="GPS_Teleport", col="Δ_gps_km", threshold=2.0, op='gt'),
 
-        # 15. Trip Length Checks (Trip Level)
-        #df = filter_short_trips(df, min_length_km=MIN_TRIP_KM, odo_col=ODO_COL, trip_id_col=TRIP_ID_COL)
-        #df = filter_long_trips(df, max_length_km=MAX_TRIP_KM, odo_col=ODO_COL, trip_id_col=TRIP_ID_COL)
+        #     # B. High-Impact Sensor Glitch Checks
+        #     #    - Within a single 60-second array
+        #     speed_spike_rule(limit=25.0), # Checks 'speed_max_internal_delta_kph'
+        #     simple_threshold_rule(name="Altitude_Spike_Internal", col="alt_max_internal_delta_m", threshold=25.0, op='gt'),
+        #     #    - Between consecutive rows (the physical jump)
+        #     simple_threshold_rule(name="Speed_Edge_Jump", col="speed_edge_delta_kph", threshold=25, op='abs_gt'),
+        #     # CORRECTED RULE: Now points to the physical jump between arrays, not the change in medians.
+        #     simple_threshold_rule(name="Altitude_Edge_Jump", col="alt_edge_delta_m", threshold=30, op='abs_gt'),
 
-        # 16. Trip Start/End Consistency Check (Trip Level)
-        # Use RENAMED cycle start/end columns
-        start_end_pairs = [
-            ('cycle_datetime_start', 'cycle_datetime_end', 'increase'), # Time must increase
-            ('cycle_odo_start', 'cycle_odo_end', 'increase_allow_equal'), # Odo must increase or stay same
-            ('cycle_soc_start', 'cycle_soc_end', 'decrease_allow_equal') # SoC should decrease or stay same
-        ]
-        df = filter_trip_start_end_inconsistency(df, trip_id_col=TRIP_ID_COL, check_pairs=start_end_pairs)
+        #     # C. Multi-variate Plausibility Checks
+        #     speed_spike_while_stationary_rule(speed_spike_thr=20.0, max_dist_km=0.02),
+        #     simple_threshold_rule(name="SoC_Jump", col="Δ_soc_pct", threshold=2.0, op='abs_gt'),
+            
+        #     # D. Consistency Between Different Distance Measures
+        #     ratio_rule(lhs='Δ_odo_km', rhs='Δ_gps_km', max_ratio=3.0, min_move=0.1),
+        #     ratio_rule(lhs='Δ_odo_km', rhs='Δ_dist_from_speed_km', max_ratio=3.0, min_move=0.1),
 
-        # 17. Placeholder Filter
-        df = filter_distance_from_route(df)
+        #     # E. Advanced Physics and Cross-Family Plausibility Checks
+        #     grade_rule(name="Impossible_Grade_vs_GPS", dist_col='Δ_gps_km', max_grade=0.30),
+        #     grade_rule(name="Impossible_Grade_vs_Odo", dist_col='Δ_odo_km', max_grade=0.30),
+        #     energy_per_100km_rule("Energy_Consumption_Outlier", min_kWh_100km=3, max_kWh_100km=50, min_move_km=1.0),
+        #     charging_while_moving_rule(min_regen_pct=0.5, min_dist_km=0.1),
+        #     uphill_no_energy_rule(min_alt_gain_m=50, max_soc_gain_pct=0.2),
+        #     descent_no_speed_change_rule(min_alt_loss_m=50.0, max_speed_delta_kph=5.0),
+        #     odo_jump_short_time_rule(odo_jump_km=1.0, max_time_s=10.0),
+        #     teleport_with_no_energy_change_rule(teleport_dist_km=2.0, max_soc_change_pct=0.5),
+        #     unrealistic_regen_on_descent_rule(min_alt_loss_m=100.0, max_regen_pct=2.0),
+            
+        #     # (Optional) A rule to monitor the change in median altitude if you still want to track it.
+        #     # This is now clearly named to reflect what it does. Threshold might need tuning.
+        #     simple_threshold_rule(name="Altitude_Trend_Change", col="Δ_alt_m", threshold=55, op='abs_gt'),
+        # ]
+
+        # # --- 3. Run the Analysis ---
+        # deltas_df, flags_df = analyze_feature_misalignment(df, CONFIG, all_rules)
+
+        # # --- 4. Review the Results ---
+        # rule_hit_counts = flags_df.sum().sort_values(ascending=False)
+        # trip_hit_counts = flags_df.groupby(df[CONFIG.trip_id]).any().sum().sort_values(ascending=False)
+
+        # print("\n--- Misalignment Results (V3 - Hardened) ---")
+        # print("\nTop-15 rules by number of rows flagged:")
+        # print(rule_hit_counts.head(15))
+
+        # print("\nTop-15 rules by number of trips flagged:")
+        # print(trip_hit_counts.head(15))
+
+        # # --- 5. Build and Print the Detailed Report (for manual inspection) ---
+        # final_report = build_report(df, deltas_df, flags_df)
+        # print_misalignment_report(
+        #     report_df=final_report,
+        #     raw_df=df,
+        #     deltas=deltas_df,
+        #     all_rules=all_rules,
+        #     cfg=CONFIG,
+        #     context_window=3,
+        #     max_trips=5
+        # )
+
+        ############################################################################################
+
+
+
+
+
+    #     # --- Two-Pass Analysis for Consecutive Value Differences ---
+    #     print("\n--- Running Detailed Analysis of Consecutive Value Differences ---")
+
+        # Define the configuration for the checks using constants from the top of the script.
+        consecutive_checks_config = {
+            # 'location': {
+            #     'both': {'min': 0.0, 'max': MAX_LOCATION_DIFF}
+            # },
+            # SOC_COL: {
+            #     'pos': {'min': 0.0, 'max': POS_MAX_SOC_DIFF},
+            #     'neg': {'min': 0.0, 'max': NEG_MAX_SOC_DIFF}
+            # },
+            # SPEED_ARRAY_COL: {
+            #     'pos': {'min': 0.0, 'max': POS_MAX_SPEED_DIFF},
+            #     'neg': {'min': 0.0, 'max': NEG_MAX_SPEED_DIFF}
+            # },
+            # ALT_ARRAY_COL: {
+            #     'pos': {'min': 0.0, 'max': POS_MAX_ALT_DIFF},
+            #     'neg': {'min': 0.0, 'max': NEG_MAX_ALT_DIFF}
+            # },
+            # VEHICLE_TEMP_COL: {
+            #     'pos': {'min': 0.0, 'max': POS_MAX_TEMP_DIFF},
+            #     'neg': {'min': 0.0, 'max': NEG_MAX_TEMP_DIFF}
+            # },
+            TIME_COL: {
+                'pos': {'min': MIN_TIME_GAP_SECONDS, 'max': MAX_TIME_GAP_SECONDS}
+            }#,
+            # ODO_COL: {
+            #     'pos': {'min': 0.0, 'max': POS_MAX_ODO_DIFF},
+            #     'neg': {'min': 0.0, 'max': NEG_MAX_ODO_DIFF}
+            # },
+            # BATT_HEALTH_COL: {
+            #     'neg': {'min': 0.0, 'max': NEG_MAX_SOH_DIFF}
+            # }
+        }
+
+        # --- Pass 1: Run analysis to find all violations, including time gaps ---
+        initial_violations_report = analyze_consecutive_values(
+            df,
+            trip_id_col=TRIP_ID_COL,
+            time_col=TIME_COL,
+            checks_config=consecutive_checks_config,
+            lat_col=LAT_COL, lon_col=LON_COL, h3_col=H3_COL,
+            max_details_to_print=0 # Suppress detailed printing for the first pass
+        )
+
+        # --- Flagging Step: Create the 'is_start_after_gap' column based on the initial report ---
+        print("\n--- Flagging Rows with Irregular Time Gaps ---")
+        df['is_start_after_gap'] = 0
+        if initial_violations_report:
+            gap_indices = []
+            # Iterate through all violations in the generated report
+            for violations in initial_violations_report.values():
+                for v in violations:
+                    # Check if the violation is for the timestamp column (either too small or too large)
+                    if v['column'] == TIME_COL:
+                        gap_indices.append(v['row_index'])
+            
+            if gap_indices:
+                unique_gap_indices = sorted(list(set(gap_indices)))
+                df.loc[unique_gap_indices, 'is_start_after_gap'] = 1
+                print(f"Flagged {len(unique_gap_indices)} rows with irregular time gaps (outside range [{MIN_TIME_GAP_SECONDS}s, {MAX_TIME_GAP_SECONDS}s]).")
+            else:
+                print("No irregular time gaps were found to flag.")
+        else:
+            print("No violations found in initial pass, skipping time gap flagging.")
+
+        # if 'is_start_after_gap' in df.columns:
+        #     print_multi_gap_contexts(
+        #         df=df,
+        #         trip_id_col=TRIP_ID_COL,
+        #         time_col=TIME_COL,
+        #         gap_flag_col='is_start_after_gap',
+        #         context_window=5,  # Look 4 rows before and 4 after
+        #         max_prints=1000      # Stop after printing 10 examples
+        #     )
+        
+    #     # --- Pass 2: Re-run analysis, this time ignoring violations at the flagged gaps ---
+    #     final_violations_report = analyze_consecutive_values(
+    #         df,
+    #         trip_id_col=TRIP_ID_COL,
+    #         time_col=TIME_COL,
+    #         checks_config=consecutive_checks_config,
+    #         lat_col=LAT_COL, lon_col=LON_COL, h3_col=H3_COL,
+    #         gap_flag_col='is_start_after_gap', # Activate the filtering logic
+    #         max_details_to_print=1000,
+    #         context_window=18
+    #     )
+        
+    #     if final_violations_report:
+    #         print(f"\nFinal analysis complete. Found {len(final_violations_report)} trips with non-gap-related violations.")
+    #     else:
+    #         print("\nFinal analysis complete. No non-gap-related violations found.")
+    #     # --- End of Two-Pass Analysis ---
 
         # --- Final Check & Save ---
         print("\n--- Final Data Check ---")
@@ -1212,12 +1952,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-# make sure that all GPS is in land (i.e., not in the sea)
-# make sure that the following cols do not have higher than logical diff between consecutive (within cycle) timestamps: distance (GPS and odometer), duration, temp, alltitude, speed, soc, battery health).
-# make sure that the diff is in logical direction fof the relevant cols (e.g. odometer increasing, timestamp increasing, soc decreasing etc.)
-# make sure that there are no negative values where there shouldn't be (e.g. battery health, odometer etc.)
-# make sure that the odometer change / gps change is reasonble to the speed.
-# make sure that the feature are in logical ranges (e.g. for weight, temp, soc, battery health,  alltitude, speed, odometer etc.)
-# make sure that all the differences between cycles start to cycle ends are logical (e.g. decrease in soc, increase in time, increase in odometer etc.)
-

@@ -14,6 +14,10 @@ from polyline import decode
 import traceback # For detailed error logging
 import matplotlib.pyplot as plt
 import seaborn as sns
+import fiona
+from itertools import chain
+from dataclasses import dataclass
+from typing import List, Any, Callable, Tuple
 
 def load_file(filepath, **kwargs):
     """
@@ -260,6 +264,107 @@ def is_on_land(lat, lon):
     point = ShapelyPoint(lon, lat)
     return land.contains(point)
 
+# --- Main Function to get the geometry of the target countries ---
+# --- NEW GADM-FOCUSED Function to get the geometry ---
+def get_gadm_countries_geometry(gadm_directory, country_iso_codes, buffer_meters=1000):
+    """
+    Loads high-resolution GADM data for specified countries, automatically finds
+    the correct layer name, combines them, and applies a buffer.
+    """
+    print(f"Loading GADM data from: {gadm_directory}")
+    country_geometries = []
+
+    for code in country_iso_codes:
+        file_path = os.path.join(gadm_directory, f"gadm41_{code}.gpkg")
+        if not os.path.exists(file_path):
+            print(f"Warning: GADM file not found for {code} at {file_path}. Skipping.")
+            continue
+        
+        try:
+            # --- Automatic Layer Detection ---
+            # 1. List all layers in the GeoPackage
+            available_layers = fiona.listlayers(file_path)
+            
+            # 2. Find the layer that ends with '_0' (this is the country boundary)
+            target_layer = next((layer for layer in available_layers if layer.endswith('_0')), None)
+            
+            if not target_layer:
+                print(f"Error: Could not find a Level 0 boundary layer in {file_path}. Available: {available_layers}")
+                continue
+            # --- End of Detection ---
+
+            print(f"Found target layer '{target_layer}' for {code}.")
+            
+            # 3. Read the data using the discovered layer name
+            country_gdf = gpd.read_file(file_path, layer=target_layer)
+            country_geometries.append(country_gdf)
+            print(f"Successfully loaded GADM data for {code}.")
+
+        except Exception as e:
+            print(f"An error occurred while processing the file for {code}: {e}")
+            continue
+
+    if not country_geometries:
+        print("Error: No GADM data could be loaded. Please check paths and codes.")
+        return None
+
+    # Combine all loaded countries into a single GeoDataFrame
+    all_countries_gdf = pd.concat(country_geometries, ignore_index=True)
+    all_countries_gdf = all_countries_gdf.to_crs("EPSG:4326")
+
+    print(f"Applying a {buffer_meters}-meter buffer to the high-resolution geometry...")
+    metric_gdf = all_countries_gdf.to_crs("EPSG:3035")
+    metric_gdf['geometry'] = metric_gdf.geometry.buffer(buffer_meters)
+    buffered_gdf = metric_gdf.to_crs("EPSG:4326")
+    
+    return buffered_gdf.geometry.unary_union
+
+# --- MODIFIED function to find and return points outside the area ---
+def find_points_outside_target_area(df, target_geometry, trip_id_col='trip_id', lat_col='latitude', lon_col='longitude'):
+    """
+    Identifies points in a DataFrame that are outside a given target geometry
+    and returns their trip ID and coordinates.
+
+    Args:
+        df (pd.DataFrame): The DataFrame to check.
+        target_geometry (shapely.geometry): The unified geometry of the target area.
+        trip_id_col (str): The name of the trip ID column.
+        lat_col (str): The name of the latitude column.
+        lon_col (str): The name of the longitude column.
+        h3_col (str, optional): The name of the H3 index column to use for coordinates.
+
+    Returns:
+        pd.DataFrame: A DataFrame with trip_id, latitude, and longitude of points
+                      that are OUTSIDE the target area.
+    """
+    if target_geometry is None:
+        print("Error: Target geometry is invalid. Cannot perform check.")
+        return pd.DataFrame(columns=[trip_id_col, lat_col, lon_col])
+
+    df_copy = df.copy()
+
+    # Ensure required columns exist before proceeding
+    required_cols = [trip_id_col, lat_col, lon_col]
+    if not all(col in df_copy.columns for col in required_cols):
+        print(f"Error: Missing one of the required columns: {required_cols}")
+        return pd.DataFrame(columns=required_cols)
+
+    # Create a GeoDataFrame from the points
+    points_gdf = gpd.GeoDataFrame(
+        df_copy,
+        geometry=gpd.points_from_xy(df_copy[lon_col], df_copy[lat_col]),
+        crs="EPSG:4326"
+    )
+
+    # Perform the spatial check to find points inside the target area
+    is_inside = points_gdf.within(target_geometry)
+
+    # Filter to get only the points that are OUTSIDE
+    outside_points_gdf = points_gdf[~is_inside]
+
+    # Return only the requested columns for the outside points
+    return outside_points_gdf[[trip_id_col, lat_col, lon_col]].reset_index(drop=True)
+
 # --- Placeholder for DEM-based Elevation Change along Route ---
 # This would require querying DEM multiple times along the route geometry from OSRM/GraphHopper
 # Or using GraphHopper/Valhalla if they provide elevation profile directly.
@@ -270,13 +375,13 @@ def get_route_elevation_change(start_lat, start_lon, end_lat, end_lon):
 
 def get_trip_level_df(df):
     """
-    Aggregate dataframe to trip level by 'CYCLE_ID'.
+    Aggregate dataframe to trip level by 'trip_id'.
 
     Parameters:
     - df (pd.DataFrame): Input dataframe with potentially multiple rows per trip.
 
     Returns:
-    - trip_level_df (pd.DataFrame): Dataframe with one row per 'CYCLE_ID'.
+    - trip_level_df (pd.DataFrame): Dataframe with one row per 'trip_id'.
     """
     df_copy = df.copy()
     # Define trip-level columns
@@ -290,7 +395,7 @@ def get_trip_level_df(df):
     # Check which columns are actually present in the dataframe
     available_cols = [col for col in trip_level_cols if col in df_copy.columns]
     agg_dict = {col: 'first' for col in available_cols}
-    trip_level_df = df_copy.groupby('CYCLE_ID').agg(agg_dict).reset_index()
+    trip_level_df = df_copy.groupby('trip_id').agg(agg_dict).reset_index()
 
     return trip_level_df
 
@@ -317,7 +422,7 @@ def random_partition(total, parts, random_state=42):
     partition.append(total + parts - 1 - dividers[-1])
     
     return partition
-
+   
 # --- Safely calculate mean of potential array/scalar ---
 def safe_mean(val):
     """
@@ -350,9 +455,9 @@ def drop_short_long_trips(df, min_dur=0, min_dis=0, max_dur=1_000, max_dis=1_000
 
     df_copy = df.copy()
 
-    df_filtered = df_copy[(df_copy['cycle_duration'] > min_dur) & (df_copy['cycle_duration'] < max_dur)] 
+    df_filtered = df_copy[(df_copy['trip_duration'] > min_dur) & (df_copy['trip_duration'] < max_dur)] 
 
-    df_filtered = df_filtered[(df_filtered['cycle_distance'] > min_dis) & (df_filtered['cycle_distance'] < max_dis)] 
+    df_filtered = df_filtered[(df_filtered['trip_distance'] > min_dis) & (df_filtered['trip_distance'] < max_dis)] 
 
     return df_filtered
 
@@ -513,7 +618,6 @@ def calculate_stop_features(segment_flags, timestamps):
         return {'stops_seg_count': 0, 'stop_duration_seg_agg_s': 0.0}
     
 # --- OSRM Interaction Helpers ---
-
 def get_osrm_route(coordinates, profile='driving', base_url="http://router.project-osrm.org"):
     """Gets the direct route between the first and last coordinate using OSRM."""
     # (Keep implementation from previous step - gets direct route distance)
@@ -963,3 +1067,365 @@ def display_and_save_feature_importances(model, feature_names, model_name_label,
         warnings.warn(f"Could not save feature importance plot: {e}")
     # plt.show() # Optionally show plot
     plt.close()
+
+def plot_trip_speed_profiles(df, trip_ids, col, y_max, output_dir, trip_id_col='trip_id', plots_per_figure=8):
+    """
+    Generates and saves grids of line plots for all specified trip IDs,
+    batching them into multiple image files.
+
+    Args:
+        df (pd.DataFrame): The DataFrame containing the trip data.
+        trip_ids (list or np.ndarray): An array of all trip IDs to plot.
+        col (str): The name of the array-like column to plot (e.g., 'speed_array').
+        y_max (float): The maximum valid value to draw as a reference line.
+        output_dir (str): The directory where the plot images will be saved.
+        trip_id_col (str): The name of the trip identifier column.
+        plots_per_figure (int): The number of subplots to include in each saved image file.
+    """
+    if not trip_ids.any():
+        return
+
+    # --- Create the output directory if it doesn't exist ---
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except OSError as e:
+        print(f"   Warning: Could not create directory {output_dir}. Error: {e}")
+        return
+
+    print(f"   Generating speed profile plots for {len(trip_ids)} affected trips...")
+    
+    # --- Loop through the trip IDs in batches ---
+    for i in range(0, len(trip_ids), plots_per_figure):
+        chunk_of_trip_ids = trip_ids[i : i + plots_per_figure]
+        
+        num_plots_in_chunk = len(chunk_of_trip_ids)
+        num_cols = 2
+        num_rows = (num_plots_in_chunk + num_cols - 1) // num_cols
+        
+        fig, axes = plt.subplots(num_rows, num_cols, figsize=(18, 5 * num_rows), squeeze=False, tight_layout=True)
+        axes = axes.flatten()
+
+        for j, trip_id in enumerate(chunk_of_trip_ids):
+            ax = axes[j]
+            trip_df = df[df[trip_id_col] == trip_id]
+            
+            raw_values = list(chain.from_iterable(trip_df[col].dropna()))
+
+            if not raw_values:
+                ax.text(0.5, 0.5, 'No data to plot', ha='center', va='center')
+            else:
+                ax.plot(raw_values, label='Raw Speed', color='dodgerblue', linewidth=1)
+                ax.axhline(y=y_max, color='red', linestyle='--', label=f'Max Limit ({y_max})')
+                ax.legend()
+                # Adjust y-axis to make sure the spike is visible
+                plot_upper_bound = max(max(raw_values) + 50, y_max * 1.2)
+                ax.set_ylim(-10, plot_upper_bound)
+
+            ax.set_title(f"Trip: {trip_id}", fontsize=10)
+            ax.set_xlabel("Sample Index (Time)")
+            ax.set_ylabel("Raw Speed (kph)")
+            ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+        # Hide any unused subplots in the last figure
+        for k in range(num_plots_in_chunk, len(axes)):
+            fig.delaxes(axes[k])
+
+        # --- Save the current figure ---
+        batch_num = (i // plots_per_figure) + 1
+        plot_filename = f"{col}_profiles_batch_{batch_num}.png"
+        full_path = os.path.join(output_dir, plot_filename)
+        
+        try:
+            plt.savefig(full_path, dpi=120)
+            print(f"   Saved diagnostic plot batch {batch_num} to: {full_path}")
+        except Exception as e:
+            print(f"   Warning: Could not save diagnostic plot {full_path}. Error: {e}")
+        
+        plt.close(fig) # Close the figure to free up memory for the next batch
+
+def count_outliers_in_array(arr, min_val, max_val):
+    """Counts how many numeric values in an array are outside the given bounds."""
+    if not isinstance(arr, (list, np.ndarray)):
+        return 0
+    
+    # Use a generator expression with sum() for a concise and efficient count
+    return sum(1 for val in arr if isinstance(val, (int, float)) and not (min_val <= val <= max_val))
+
+# Helper to safely get the length of an array/list, returns -1 for non-array types or NaNs
+def get_array_length(arr):
+    if isinstance(arr, (list, np.ndarray)):
+        return len(arr)
+    return -1  # Use -1 to signify 'not an array' or 'is NaN'
+
+########################### Misalignment Report Helpers #########################################
+
+def safe_apply(series: pd.Series, func: Callable) -> pd.Series:
+    """Applies a function to each element of a series, handling non-iterable types."""
+    return pd.Series([func(arr) if isinstance(arr, (list, np.ndarray)) else np.nan for arr in series], index=series.index)
+
+safe_first = lambda arr: arr[0]  if isinstance(arr, (list, np.ndarray)) and len(arr) > 0 else np.nan
+safe_last  = lambda arr: arr[-1] if isinstance(arr, (list, np.ndarray)) and len(arr) > 0 else np.nan
+
+def safe_max_internal_delta(arr: Any) -> float:
+    """Calculates the maximum absolute consecutive change within a numeric array."""
+    if not isinstance(arr, (list, np.ndarray)) or len(arr) < 2: return np.nan
+    numeric_arr = pd.to_numeric(np.asarray(arr), errors='coerce')
+    numeric_arr = numeric_arr[~np.isnan(numeric_arr)]
+    if len(numeric_arr) < 2: return np.nan
+    return np.nanmax(np.abs(np.diff(numeric_arr)))
+
+# --- Configuration and Rule DSL (Domain-Specific Language) ---
+@dataclass(frozen=True)
+class MisalignmentConfig:
+    """A frozen (immutable) dataclass to standardize column names used in the analysis."""
+    trip_id: str = "trip_id"
+    time: str = "timestamp"
+    lat: str = "latitude"
+    lon: str = "longitude"
+    odo: str = "current_odo"
+    speed_array: str = "speed_array"
+    soc: str = "current_soc"
+    alt_array: str = "altitude_array"
+    battery_capacity_kWh_col: str = "battery_capacity_kWh"
+
+@dataclass(frozen=True)
+class Rule:
+    """Defines a rule with a name, the columns it acts on, and the boolean function to apply."""
+    name: str
+    lhs: str
+    rhs: str
+    fn: Callable[[pd.Series, pd.Series], pd.Series]
+
+def _safe_division(a: pd.Series, b: pd.Series, tol: float = 1e-6) -> pd.Series:
+    """Safely divides two series, returning np.nan where the denominator is near zero."""
+    valid_mask = b.abs() > tol
+    out = pd.Series(np.nan, index=a.index)
+    out.loc[valid_mask] = a[valid_mask] / b[valid_mask]
+    return out
+
+def _haversine_np(lon1: pd.Series, lat1: pd.Series, lon2: pd.Series, lat2: pd.Series) -> np.ndarray:
+    """Calculates Haversine distance in a vectorized way."""
+    # POINT 1 FIX: Convert to numpy arrays to ensure correct dtype for trigonometric functions
+    lon1, lat1, lon2, lat2 = lon1.to_numpy(), lat1.to_numpy(), lon2.to_numpy(), lat2.to_numpy()
+    lon1, lat1, lon2, lat2 = map(np.radians, [lon1, lat1, lon2, lat2])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = np.sin(dlat/2.0)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2.0)**2
+    c = 2 * np.arcsin(np.sqrt(a))
+    km = 6371 * c
+    return km
+
+def calculate_all_deltas(df: pd.DataFrame, cfg: MisalignmentConfig) -> pd.DataFrame:
+    """Calculates all necessary deltas in a fully vectorized way, respecting trip boundaries."""
+    # POINT 5 FIX: Add reset_index to guarantee unique labels and prevent errors
+    df_sorted = df.sort_values([cfg.trip_id, cfg.time]).reset_index(drop=True)
+    
+    grouped = df_sorted.groupby(cfg.trip_id, observed=True)
+    is_first_row = grouped.cumcount() == 0
+
+    deltas = pd.DataFrame(index=df_sorted.index)
+
+    # ... (rest of the delta calculations are the same) ...
+    deltas['Δ_time_s'] = grouped[cfg.time].diff().dt.total_seconds()
+    deltas['Δ_odo_km'] = grouped[cfg.odo].diff()
+    deltas['Δ_soc_pct'] = grouped[cfg.soc].diff()
+    lon1, lat1 = grouped[cfg.lon].shift(), grouped[cfg.lat].shift()
+    deltas['Δ_gps_km'] = _haversine_np(lon1, lat1, df_sorted[cfg.lon], df_sorted[cfg.lat])
+    deltas['Δ_dist_from_speed_km'] = safe_apply(df_sorted[cfg.speed_array], lambda arr: np.nansum(arr) / 3600.0)
+    deltas['speed_max_internal_delta_kph'] = safe_apply(df_sorted[cfg.speed_array], safe_max_internal_delta)
+    deltas['alt_max_internal_delta_m'] = safe_apply(df_sorted[cfg.alt_array], safe_max_internal_delta)
+    alt_means = safe_apply(df_sorted[cfg.alt_array], np.nanmean)
+    deltas['Δ_alt_m'] = alt_means.groupby(df_sorted[cfg.trip_id]).diff()
+    first_speed = safe_apply(df_sorted[cfg.speed_array], safe_first)
+    last_speed_shifted = safe_apply(df_sorted[cfg.speed_array], safe_last).groupby(df_sorted[cfg.trip_id]).shift()
+    deltas['speed_edge_delta_kph'] = first_speed - last_speed_shifted
+    first_alt = safe_apply(df_sorted[cfg.alt_array], safe_first)
+    last_alt_shifted = safe_apply(df_sorted[cfg.alt_array], safe_last).groupby(df_sorted[cfg.trip_id]).shift()
+    deltas['alt_edge_delta_m'] = first_alt - last_alt_shifted
+    if cfg.battery_capacity_kWh_col in df_sorted.columns:
+        deltas['Δ_energy_consumed_kWh'] = (deltas['Δ_soc_pct'] / 100.0) * df_sorted[cfg.battery_capacity_kWh_col]
+
+    # Mask out all deltas for the first row of each trip
+    deltas.loc[is_first_row, :] = np.nan
+    return deltas
+
+def evaluate_rules(deltas_df: pd.DataFrame, rules: List[Rule]) -> pd.DataFrame:
+    """Applies a list of rules to the deltas DataFrame, returning a boolean flag matrix."""
+    flags_df = pd.DataFrame(index=deltas_df.index, dtype=bool)
+    for rule in rules:
+        if rule.lhs in deltas_df.columns and rule.rhs in deltas_df.columns:
+            lhs, rhs = deltas_df[rule.lhs], deltas_df[rule.rhs]
+            valid_mask = lhs.notna() & rhs.notna()
+            flags = pd.Series(False, index=deltas_df.index)
+            if valid_mask.any():
+                flags.loc[valid_mask] = rule.fn(lhs[valid_mask], rhs[valid_mask])
+            flags_df[rule.name] = flags.fillna(False)
+    return flags_df
+
+# --- Rule Definition Helpers (The DSL) ---
+def ratio_rule(lhs: str, rhs: str, max_ratio: float, min_move: float = 0.05) -> Rule:
+    """Creates a symmetric ratio rule, but only for values above a minimum movement threshold."""
+    def rule_fn(a: pd.Series, b: pd.Series) -> pd.Series:
+        movement_mask = (a.abs() > min_move) | (b.abs() > min_move)
+        flags = pd.Series(False, index=a.index)
+        if movement_mask.any():
+            a_m, b_m = a[movement_mask].abs(), b[movement_mask].abs()
+            # POINT 2 FIX: Use np.maximum/minimum and reconstruct Series to preserve index
+            num = np.maximum(a_m, b_m)
+            den = np.minimum(a_m, b_m)
+            ratio = pd.Series(_safe_division(num, den), index=a_m.index)
+            flags.loc[movement_mask] = (ratio > max_ratio).fillna(False)
+        return flags
+    return Rule(name=f"Ratio_{lhs}_vs_{rhs}", lhs=lhs, rhs=rhs, fn=rule_fn)
+
+def simple_threshold_rule(name: str, col: str, threshold: float, op: str = 'gt') -> Rule:
+    """Creates a rule for a simple comparison (gt, lt, eq, abs_gt)."""
+    ops = {'gt': lambda x: x > threshold, 'lt': lambda x: x < threshold, 'eq': lambda x: x == threshold, 'abs_gt': lambda x: x.abs() > threshold}
+    return Rule(name=name, lhs=col, rhs=col, fn=lambda a, b: ops[op](a))
+
+def grade_rule(name: str, dist_col: str, max_grade: float = 0.25, min_move_km: float = 0.05) -> Rule:
+    """Creates a rule to check for physically impossible road grades."""
+    # POINT 3 FIX: Renamed parameters for clarity
+    def rule_fn(alt_delta: pd.Series, dist_km: pd.Series) -> pd.Series:
+        movement_mask = dist_km.abs() >= min_move_km
+        grade = _safe_division(alt_delta, dist_km * 1000)
+        return movement_mask & (grade.abs() > max_grade)
+    return Rule(name=name, lhs='Δ_alt_m', rhs=dist_col, fn=rule_fn)
+
+def energy_per_100km_rule(name: str, min_kWh_100km: float, max_kWh_100km: float, min_move_km: float = 0.5) -> Rule:
+    """Flags energy consumption (kWh/100km) outside a plausible physical range."""
+    def rule_fn(energy_kWh: pd.Series, dist_km: pd.Series) -> pd.Series:
+        movement_mask = (dist_km.abs() > min_move_km)
+        # POINT 4 FIX: Only check for consumption (energy_kWh is negative), not regeneration.
+        consumption_mask = energy_kWh < 0
+        
+        # Note: A negative energy delta means consumption (SoC went down).
+        kwh_per_100km = _safe_division(-energy_kWh, dist_km) * 100
+        consumption_outlier = (kwh_per_100km < min_kWh_100km) | (kwh_per_100km > max_kWh_100km)
+        
+        return movement_mask & consumption_mask & consumption_outlier
+    return Rule(name=name, lhs='Δ_energy_consumed_kWh', rhs='Δ_gps_km', fn=rule_fn)
+
+# POINT 6: Add helper functions for the new powerful rules
+def speed_spike_rule(limit: float = 40.0) -> Rule:
+    """Rule for excessive within-array acceleration (e.g., >40 km/h in one second)."""
+    return simple_threshold_rule(name="Speed_Spike_Internal", col="speed_max_internal_delta_kph", threshold=limit, op='gt')
+
+def alt_spike_across_rows_rule(limit: float = 25.0) -> Rule:
+    """Rule for a large altitude jump between consecutive rows (GPS glitch, tunnel)."""
+    return simple_threshold_rule(name="Altitude_Row_Spike", col="Δ_alt_m", threshold=limit, op='abs_gt')
+
+# (Other rule helpers like charging_while_moving_rule, uphill_no_energy_rule remain the same)
+def charging_while_moving_rule(min_regen_pct: float = 0.01, min_dist_km: float = 0.01) -> Rule:
+    def rule_fn(soc_delta: pd.Series, dist_delta: pd.Series) -> pd.Series:
+        is_charging = soc_delta > min_regen_pct
+        is_moving = dist_delta > min_dist_km
+        return is_charging & is_moving
+    return Rule(name="Charging_While_Moving", lhs="Δ_soc_pct", rhs="Δ_gps_km", fn=rule_fn)
+
+def uphill_no_energy_rule(min_alt_gain_m: float = 20.0, max_soc_gain_pct: float = 0.1) -> Rule:
+    def rule_fn(alt_delta: pd.Series, soc_delta: pd.Series) -> pd.Series:
+        is_uphill = alt_delta > min_alt_gain_m
+        not_discharging = soc_delta < max_soc_gain_pct
+        return is_uphill & not_discharging
+    return Rule(name="Uphill_No_Discharge", lhs="Δ_alt_m", rhs="Δ_soc_pct", fn=rule_fn)
+
+def time_gap_rule(min_s: float, max_s: float) -> Rule:
+    """Flags rows where the time delta is outside the normal [min_s, max_s] band."""
+    def rule_fn(dt: pd.Series, _unused: pd.Series) -> pd.Series:
+        return (dt < min_s) | (dt > max_s)
+    return Rule(name="Time_Gap_Anomaly", lhs="Δ_time_s", rhs="Δ_time_s", fn=rule_fn)
+
+def descent_no_speed_change_rule(min_alt_loss_m: float = 50.0, max_speed_delta_kph: float = 5.0) -> Rule:
+    """Flags steep descents where the vehicle's speed barely changes."""
+    def rule_fn(alt_delta: pd.Series, speed_delta: pd.Series) -> pd.Series:
+        is_steep_descent = alt_delta < -min_alt_loss_m
+        speed_is_stuck = speed_delta.abs() < max_speed_delta_kph
+        return is_steep_descent & speed_is_stuck
+    # Note: We use speed_max_internal_delta_kph to check for any speed change within the minute.
+    return Rule(name="Descent_No_Speed_Change", lhs="Δ_alt_m", rhs="speed_max_internal_delta_kph", fn=rule_fn)
+
+def speed_spike_while_stationary_rule(speed_spike_thr: float = 30.0, max_dist_km: float = 0.02) -> Rule:
+    """Flags a large internal speed spike when the vehicle is effectively stationary."""
+    def rule_fn(speed_spike: pd.Series, gps_dist: pd.Series) -> pd.Series:
+        return (speed_spike > speed_spike_thr) & (gps_dist.abs() < max_dist_km)
+    return Rule(name="Speed_Spike_While_Stationary", lhs="speed_max_internal_delta_kph", rhs="Δ_gps_km", fn=rule_fn)
+
+def odo_jump_short_time_rule(odo_jump_km: float = 1.0, max_time_s: float = 10.0) -> Rule:
+    """Flags a large odometer jump occurring in a very short time (implies impossible speed)."""
+    def rule_fn(odo_delta: pd.Series, time_delta: pd.Series) -> pd.Series:
+        return (odo_delta.abs() > odo_jump_km) & (time_delta < max_time_s)
+    return Rule(name="Odo_Jump_Short_Time", lhs="Δ_odo_km", rhs="Δ_time_s", fn=rule_fn)
+
+def teleport_with_no_energy_change_rule(teleport_dist_km: float = 2.0, max_soc_change_pct: float = 0.5) -> Rule:
+    """Flags a large GPS jump that has no corresponding energy change (e.g., ferry, transport)."""
+    def rule_fn(gps_delta: pd.Series, soc_delta: pd.Series) -> pd.Series:
+        return (gps_delta > teleport_dist_km) & (soc_delta.abs() < max_soc_change_pct)
+    return Rule(name="Teleport_With_No_Energy_Change", lhs="Δ_gps_km", rhs="Δ_soc_pct", fn=rule_fn)
+
+def unrealistic_regen_on_descent_rule(min_alt_loss_m: float = 100.0, max_regen_pct: float = 2.0) -> Rule:
+    """Flags an implausibly high amount of regeneration during a steep descent."""
+    def rule_fn(alt_delta: pd.Series, soc_delta: pd.Series) -> pd.Series:
+        # A negative soc_delta means regen (gaining charge), so we check if it's "too negative".
+        return (alt_delta < -min_alt_loss_m) & (soc_delta < -max_regen_pct)
+    return Rule(name="Unrealistic_Regen_On_Descent", lhs="Δ_alt_m", rhs="Δ_soc_pct", fn=rule_fn)
+
+# --- Main Entry Point and Reporting ---
+def analyze_feature_misalignment(df: pd.DataFrame, cfg: MisalignmentConfig, rules: List[Rule]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    print("--- Analyzing Feature Misalignments (V3 - Hardened) ---")
+    deltas_df = calculate_all_deltas(df, cfg)
+
+    if not deltas_df.columns.is_unique:
+        dupes = deltas_df.columns[deltas_df.columns.duplicated()].unique()
+        raise RuntimeError(f"Duplicate delta columns: {dupes}")
+
+    flags_df = evaluate_rules(deltas_df, rules)
+    return deltas_df, flags_df
+
+def build_report(df: pd.DataFrame, deltas: pd.DataFrame, flags: pd.DataFrame) -> pd.DataFrame:
+    if not flags.any().any(): return pd.DataFrame()
+    flagged_rows = flags.any(axis=1)
+    # Ensure columns from all three dataframes are concatenated correctly
+    return pd.concat([df.loc[flagged_rows], deltas.loc[flagged_rows], flags.loc[flagged_rows]], axis=1)
+
+def print_misalignment_report(report_df: pd.DataFrame, raw_df: pd.DataFrame, deltas: pd.DataFrame, all_rules: List[Rule], cfg: MisalignmentConfig, context_window: int, max_trips: int):
+    if report_df.empty:
+        print("No misalignments found."); return
+    
+    flag_cols = [r.name for r in all_rules if r.name in report_df.columns]
+    flagged_trips = report_df[cfg.trip_id].unique()
+    
+    print(f"\n--- Misalignment Report Summary ---")
+    print(f"Trips checked : {raw_df[cfg.trip_id].nunique():>5}")
+    print(f"Trips flagged : {len(flagged_trips):>5}")
+    print(f"Rows flagged  : {len(report_df):>5}\n")
+
+    for i, trip_id in enumerate(flagged_trips):
+        if i >= max_trips: print(f"... (omitting details for {len(flagged_trips) - max_trips} more trips)"); break
+        
+        print(f"--- Details for Trip ID: {trip_id} ---")
+        trip_report_df = report_df[report_df[cfg.trip_id] == trip_id]
+        
+        # Use the full deltas dataframe for context, not just the flagged rows
+        full_trip_context_df = pd.concat([
+            raw_df[raw_df[cfg.trip_id] == trip_id],
+            deltas[raw_df[cfg.trip_id] == trip_id]
+        ], axis=1)
+
+        for idx in trip_report_df.index:
+            fired_rules = [rule for rule in flag_cols if trip_report_df.loc[idx, rule]]
+            print(f"\n  - Row Index {idx} ({trip_report_df.loc[idx, cfg.time]}): VIOLATIONS -> {fired_rules}")
+            
+            try:
+                row_loc = full_trip_context_df.index.get_loc(idx)
+                start_loc = max(0, row_loc - context_window)
+                end_loc = min(len(full_trip_context_df), row_loc + 1 + context_window)
+                
+                context_df = full_trip_context_df.iloc[start_loc:end_loc]
+                print("    Context (Raw Data + Deltas):")
+                display_cols = [cfg.time, cfg.odo, cfg.soc] + [c for c in context_df.columns if c.startswith('Δ_')]
+                # Ensure display_cols exist before trying to print
+                display_cols_exist = [c for c in display_cols if c in context_df.columns]
+                print(context_df[display_cols_exist].to_string(float_format="%.3f"))
+            except KeyError:
+                print(f"    Could not find index {idx} in the context DataFrame for trip {trip_id}.")
