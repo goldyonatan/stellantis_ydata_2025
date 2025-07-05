@@ -6,7 +6,7 @@ import traceback
 
 # --- Import necessary functions from HelperFuncs ---
 try:
-    from HelperFuncs import load_file, save_file, random_partition, safe_mean, sort_df_by_trip_time
+    from HelperFuncs import load_file, save_file, random_partition, safe_mean, sort_df_by_trip_time, find_seg_start_idx
 except ImportError:
     print("Error: Could not import from HelperFuncs. Ensure HelperFuncs.py is accessible.")
     def load_file(filepath, **kwargs): raise NotImplementedError("HelperFuncs not found")
@@ -327,77 +327,48 @@ def evaluate_segmentation_rules(df, trips_seg_dict, stop_flag_col='stop_flag',
     
     df_flags = df.set_index(trip_id_col)[stop_flag_col]
 
-    for trip_id, labels in trips_seg_dict.items():
+    for trip_id, trip_labels in trips_seg_dict.items():
         trip_violations = []
         trip_flags = df_flags.loc[trip_id].values
         
-        segment_ids = np.unique(labels[labels > 0])
+        segment_ids = np.unique(trip_labels[trip_labels > 0])
         
         for seg_id in segment_ids:
-            labeled_indices = np.where(labels == seg_id)[0]
+            labeled_indices = np.where(trip_labels == seg_id)[0]
             if len(labeled_indices) == 0: continue
             
             first_labeled_idx = labeled_indices[0]
             last_labeled_idx = labeled_indices[-1]
 
-            # --- FINAL CORRECTED LOGIC (V8): The "Last Anchor" Principle ---
-
-            # 1. Define the "search space" for the prefix. This space starts after the
-            #    previous segment or hard boundary and ends right before the current segment's core.
-            search_space_start_idx = 0
-            for i in range(first_labeled_idx - 1, -1, -1):
-                # A full_stop sequence is a hard boundary.
-                if i >= full_stop - 1 and np.all(trip_flags[i - (full_stop - 1) : i + 1] == -1):
-                    search_space_start_idx = i + 1
-                    break
-                # Other hard boundaries.
-                if labels[i] > 0 or trip_flags[i] in [0, -3]:
-                    search_space_start_idx = i + 1
-                    break
-                search_space_start_idx = i
-
-            # 2. Find the "anchor" of the segment. The anchor is the LAST -2 flag within the search space.
-            #    If no -2 exists, the segment is anchored by its first labeled point (a 0).
-            anchor_idx = -1
-            for i in range(first_labeled_idx - 1, search_space_start_idx - 1, -1):
-                if trip_flags[i] == -2:
-                    anchor_idx = i
-                    break
-            
-            # 3. Determine the final segment start index.
-            if anchor_idx != -1:
-                # An anchor was found. The segment span starts at this anchor.
-                segment_start_idx = anchor_idx
-            else:
-                # No -2 anchor. The segment must start with a 0, which is the first labeled point.
-                segment_start_idx = first_labeled_idx
+            segment_start_idx = find_seg_start_idx(trip_labels, first_labeled_idx)
 
             # Define the final, correct segment span.
             segment_span_indices = np.arange(segment_start_idx, last_labeled_idx + 1)
             segment_span_flags = trip_flags[segment_span_indices]
+            segment_span_labels = trip_labels[segment_span_indices]
             
             if len(segment_span_flags) == 0: continue
 
             # --- Apply Rules to the Correctly Identified Span ---
 
             # Rule 1: First Sample Check
-            if segment_span_flags[0] in [-1, -3]:
-                trip_violations.append(f"Segment {seg_id} violates START rule: Span starts with flag {segment_span_flags[0]} at index {segment_start_idx}.")
+            if segment_span_labels[0] in [-1, -3]:
+                trip_violations.append(f"Segment {seg_id} violates START rule: Span starts with flag {segment_span_labels[0]} at index {segment_start_idx}.")
 
             # Rule 2: Last Sample Check
-            if segment_span_flags[-1] in [-1, -2, -3]:
-                trip_violations.append(f"Segment {seg_id} violates END rule: Ends with flag {segment_span_flags[-1]} at index {last_labeled_idx}.")
+            if segment_span_labels[-1] in [-1, -2, -3]:
+                trip_violations.append(f"Segment {seg_id} violates END rule: Ends with flag {segment_span_labels[-1]} at index {last_labeled_idx}.")
 
             # Rule 3: Mid-Segment Gap Check
-            if len(segment_span_flags) > 2:
-                mid_flags = segment_span_flags[1:-1]
-                if np.any(np.isin(mid_flags, [-2, -3])):
-                    violating_idx_local = 1 + np.where(np.isin(mid_flags, [-2, -3]))[0][0]
-                    violating_idx_global = segment_span_indices[violating_idx_local]
-                    trip_violations.append(f"Segment {seg_id} violates MID-SEGMENT rule: Contains gap flag {trip_flags[violating_idx_global]} at index {violating_idx_global}.")
+            if len(segment_span_labels) > 2:
+                mid_labels = segment_span_labels[1:-1]
+                if np.any(np.isin(mid_labels, [-2, -3])):
+                    violating_idx_local = 1 + np.where(np.isin(mid_labels, [-2, -3]))[0][0]
+                    violating_idx_global = segment_span_labels[violating_idx_local]
+                    trip_violations.append(f"Segment {seg_id} violates MID-SEGMENT rule: Contains gap flag {trip_labels[violating_idx_global]} at index {violating_idx_global}.")
 
             # Rules 4 & 5: Length Checks
-            driving_samples_count = np.sum(np.isin(segment_span_flags, [0, -2]))
+            driving_samples_count = np.sum(np.isin(segment_span_labels, [seg_id, -2]))
             max_len = 2 * min_win - 1
             if driving_samples_count < min_win:
                 trip_violations.append(f"Segment {seg_id} violates MIN LENGTH rule: Has {driving_samples_count} driving samples, less than min_win={min_win}.")
@@ -407,7 +378,7 @@ def evaluate_segmentation_rules(df, trips_seg_dict, stop_flag_col='stop_flag',
             # Rule 6: Consecutive Stops Check
             max_consecutive_stops = 0
             current_consecutive_stops = 0
-            for flag in segment_span_flags:
+            for flag in segment_span_labels:
                 if flag == -1:
                     current_consecutive_stops += 1
                 else:
@@ -445,7 +416,8 @@ def evaluate_segmentation_rules(df, trips_seg_dict, stop_flag_col='stop_flag',
 
     return violations
 
-def summarize_segmentation_results(df, trips_seg_dict, trip_id_col='trip_id', stop_flag_col='stop_flag', full_stop=3):
+def summarize_segmentation_results(df, trips_seg_dict, trip_id_col='trip_id', stop_flag_col='stop_flag',
+                                    full_stop=3, max_print_containing=3):
     """
     Analyzes the segmentation output and prints a detailed summary.
     This function is now 100% consistent with the evaluation logic, defining
@@ -476,8 +448,13 @@ def summarize_segmentation_results(df, trips_seg_dict, trip_id_col='trip_id', st
 
     print(f" - Total trips processed: {num_total_trips:,}")
     print(f" - Total segments created: {total_segments:,}")
-    print(f" - Trips containing at least one segment: {num_trips_with_segments:,} ({num_trips_with_segments/num_total_trips:.2%})")
     print(f" - Trips with NO segments (unsegmented): {num_trips_without_segments:,} ({num_trips_without_segments/num_total_trips:.2%})")
+    print(f" - Trips containing at least one segment: {num_trips_with_segments:,} ({num_trips_with_segments/num_total_trips:.2%})")
+
+    for i in range(1, max_print_containing):
+        count_i = (segments_per_trip_ser > i).sum()   # threshold = i+1 segments
+        pct_i   = count_i / num_total_trips
+        print(f" - Trips containing at least {i+1} segments: {count_i:,} ({pct_i:.2%})")
 
     # --- 2. Segments Per Trip Distribution ---
     print("\n--- II. Segments-Per-Trip Distribution (for segmented trips) ---")
@@ -628,6 +605,27 @@ def find_and_print_trip_with_max_segment(df, trips_seg_dict, trip_id_col='trip_i
     with pd.option_context('display.max_rows', None, 'display.max_columns', None):
         print(comparison_df)
 
+def print_examples(df, trips_seg_dict, trip_id_col='trip_id', stop_flag_col='stop_flag', segments_to_print=5):
+    """
+    Print n examples of stop columns and corresponding segments.
+    """
+    for i,(k,v) in enumerate(trips_seg_dict.items()):
+        stop_flags_for_trip = df[df[trip_id_col] == k][stop_flag_col].values
+        segment_labels_for_trip = trips_seg_dict[k]
+
+        # Create a DataFrame for easy side-by-side comparison
+        comparison_df = pd.DataFrame({
+            'Segment_Label': segment_labels_for_trip,
+            'Stop_Flag': stop_flags_for_trip
+        })
+
+        print(f"\nSegment labels and stop flags for trip {k}:")
+        with pd.option_context('display.max_rows', None, 'display.max_columns', None):
+            print(comparison_df)
+
+        if i == segments_to_print:
+            break
+
 # --- Main Execution Logic ---
 def main():
     """Loads cleaned data, finds stops, segments trips, and saves results."""
@@ -726,13 +724,21 @@ def main():
             full_stop=CONSECUTIVE_STOPS_FOR_BREAK
         )
 
+        print_examples(
+            df=df_clean,
+            trips_seg_dict=trips_seg_dict,
+            trip_id_col=TRIP_ID_COL,
+            stop_flag_col=STOP_FLAG_COL,
+            segments_to_print=15
+        )
+
         # 6. Save the final segmentation dictionary
         print(f"\n--- Saving Segmentation Dictionary ---")
         save_file(
             data=trips_seg_dict, path=SEGMENTATION_DICT_DIR,
             file_name=SEGMENTATION_DICT_FILENAME, format=OUTPUT_FORMAT
         )
-
+        
         print("\n--- Trip Segmentation Pipeline Complete ---")
 
     except (FileNotFoundError, TypeError, ValueError, KeyError, ImportError, Exception) as e:

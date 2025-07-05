@@ -1429,3 +1429,72 @@ def print_misalignment_report(report_df: pd.DataFrame, raw_df: pd.DataFrame, del
                 print(context_df[display_cols_exist].to_string(float_format="%.3f"))
             except KeyError:
                 print(f"    Could not find index {idx} in the context DataFrame for trip {trip_id}.")
+
+def drop_trips_with_less_than_x_segs(df, trips_seg_dict, trip_id_col='trip_id', min_segments=2):
+    """
+    Remove trips that contain fewer than `min_segments` distinct positive
+    segment IDs. Returns (filtered_df, filtered_seg_dict).
+    """
+    print(f"\n--- Filtering trips with < {min_segments} segments ---")
+    initial_trips = len(trips_seg_dict)
+    initial_rows  = len(df)
+    
+    filtered_dict = {}
+    for trip_id, seg_data in trips_seg_dict.items():
+        # Ensure seg_data is a numpy array for np.any/np.max
+        if not isinstance(seg_data, np.ndarray):
+            warnings.warn(f"Segmentation data for trip {trip_id} is not a numpy array. Skipping.")
+            continue
+        # Check if the maximum segment ID assigned is at least min_segments
+        valid_segments = seg_data[seg_data > 0] # Filter out non-positive segment IDs
+        if valid_segments.size > 0 and np.max(valid_segments) >= min_segments:
+            filtered_dict[trip_id] = seg_data
+    
+    if not filtered_dict: raise ValueError("No trips remaining after filtering for minimum segments.")    
+    final_trips = len(filtered_dict)
+    print(f" - Kept {final_trips} trips out of {initial_trips}.")
+
+    trips_to_keep = list(filtered_dict.keys())
+    
+    df_filtered = df[df[trip_id_col].isin(trips_to_keep)].copy()
+    print(f"\n--- Filtering DataFrame to Match Segmented Trips ---")
+    print(f" - Kept {len(trips_to_keep)} trips in DataFrame.")
+    print(f" - DataFrame shape after filtering trips: {df_filtered.shape} (Removed {initial_rows - len(df_filtered)} rows)")
+
+    return df_filtered, filtered_dict
+
+def find_seg_start_idx(trip_labels, first_labeled_idx, full_stop=3):             
+    """
+
+    """
+    # 1. Define the "search space" for the prefix. This space starts after the
+    #    previous segment or hard boundary and ends right before the current segment's core.
+    search_space_start_idx = 0
+    for i in range(first_labeled_idx - 1, -1, -1):
+        # A full_stop sequence is a hard boundary.
+        if i >= full_stop - 1 and np.all(trip_labels[i - (full_stop - 1) : i + 1] == -1):
+            search_space_start_idx = i + 1
+            break
+        # Other hard boundaries.
+        if trip_labels[i] > 0 or trip_labels[i] in [0, -3]:
+            search_space_start_idx = i + 1
+            break
+        search_space_start_idx = i
+
+    # 2. Find the "anchor" of the segment. The anchor is the LAST -2 flag within the search space.
+    #    If no -2 exists, the segment is anchored by its first labeled point (a 0).
+    anchor_idx = -1
+    for i in range(first_labeled_idx - 1, search_space_start_idx - 1, -1):
+        if trip_labels[i] == -2:
+            anchor_idx = i
+            break
+
+    # 3. Determine the final segment start index.
+    if anchor_idx != -1:
+        # An anchor was found. The segment span starts at this anchor.
+        seg_start_idx = anchor_idx
+    else:
+        # No -2 anchor. The segment must start with a 0, which is the first labeled point.
+        seg_start_idx = first_labeled_idx
+
+    return seg_start_idx

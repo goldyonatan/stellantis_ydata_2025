@@ -13,7 +13,7 @@ import time # For routing
 try:
     # Add safe_mean and sort_df_by_trip_time
     from HelperFuncs import (
-        load_file, save_file, safe_mean, sort_df_by_trip_time,
+        load_file, save_file, safe_mean, sort_df_by_trip_time, drop_trips_with_less_than_x_segs,
         h3_to_latlon, # Assuming H3 conversion happens in preprocess
         get_osrm_route, get_osrm_match_robust, # <-- Use new robust match helpe
         #get_route_elevation_change # Import placeholder/real implementation
@@ -79,27 +79,6 @@ TIME_DIFF_S_COL = 'time_diff_s'
 # -------------------------------------------------
 
 # --- Feature Extraction Functions ---
-
-def drop_trips_with_less_than_x_segs(cycles_seg_dict, min_segments=2):
-    """
-    Filters trips with fewer than min_segments based on max segment ID.
-    Renamed for clarity.
-    """
-    print(f"\n--- Filtering Trips with Less Than {min_segments} Segments ---")
-    filtered_dict = {}
-    initial_trips = len(cycles_seg_dict)
-    for trip_id, seg_data in cycles_seg_dict.items():
-        # Ensure seg_data is a numpy array for np.any/np.max
-        if not isinstance(seg_data, np.ndarray):
-            warnings.warn(f"Segmentation data for trip {trip_id} is not a numpy array. Skipping.")
-            continue
-        # Check if the maximum segment ID assigned is at least min_segments
-        valid_segments = seg_data[seg_data > 0] # Filter out non-positive segment IDs
-        if valid_segments.size > 0 and np.max(valid_segments) >= min_segments:
-            filtered_dict[trip_id] = seg_data
-    final_trips = len(filtered_dict)
-    print(f" - Kept {final_trips} trips out of {initial_trips}.")
-    return filtered_dict
 
 # --- UPDATED get_segments_features (calls robust match) ---
 def get_segments_features(df_clean, cycles_seg_dict,
@@ -554,19 +533,12 @@ def main():
         print(f"Loaded segmentation dict with {len(cycles_seg_dict)} trips.")
 
         # 4. Filter Segmentation Dict for Min Segments
-        filtered_cycles_seg_dict = drop_trips_with_less_than_x_segs( # Renamed function call
-            cycles_seg_dict, min_segments=MIN_SEGMENTS_PER_TRIP
+        df_clean_filtered, filtered_cycles_seg_dict = drop_trips_with_less_than_x_segs(
+            df_clean, 
+            cycles_seg_dict, 
+            trip_id_col=TRIP_ID_COL, 
+            min_segments=MIN_SEGMENTS_PER_TRIP
         )
-        if not filtered_cycles_seg_dict: raise ValueError("No trips remaining after filtering for minimum segments.")
-
-        # 5. Filter Cleaned DataFrame to Match Filtered Trips
-        trips_to_keep = list(filtered_cycles_seg_dict.keys())
-        initial_rows = len(df_clean)
-        df_clean_filtered = df_clean[df_clean[TRIP_ID_COL].isin(trips_to_keep)].copy()
-        print(f"\n--- Filtering DataFrame to Match Segmented Trips ---")
-        print(f" - Kept {len(trips_to_keep)} trips in DataFrame.")
-        print(f" - DataFrame shape after filtering trips: {df_clean_filtered.shape} (Removed {initial_rows - len(df_clean_filtered)} rows)")
-        if df_clean_filtered.empty: raise ValueError("DataFrame is empty after filtering to match segmented trips.")
 
         # 6. Extract Segment Features (Now includes map matching & behavior)
         segments_df = get_segments_features(
